@@ -42,7 +42,7 @@ gdp <- gdp %>%
   ) %>%
   rename(date = observation_date)
 
-# --- Step 2: Rolling (real-time) HP filter ---
+# rolling HP filter 
 lambda_hp <- 1600  # standard for quarterly data
 
 gdp <- gdp %>%
@@ -81,7 +81,7 @@ yields <- yields %>%
 
 
 data_clean <- data %>% 
-  filter(yyyyq >= 19601) %>%  #will take data starting from 1950
+  filter(yyyyq >= 19601) %>%  #will take data starting from 1960
   select(where(~ !all(is.na(.)))) %>%   #remove columns which are completely empty
   select(any_of(names(startindx)[!is.na(startindx[1, ])])) %>%  
   mutate(
@@ -135,20 +135,25 @@ for (v in vars) {
 }
 
 ```
+
+
 ## Adding Lags
-```{r}
+``` {r}
+
 predictors <- setdiff(names(data_merged), c("date", "price", "log_ret"))
 
 # we choose to add 4 lags 
 for (v in predictors) {
   for (lag_n in 1:4) {
-    data_clean[[paste0(v, "_L", lag_n)]] <- dplyr::lag(data_merged[[v]], lag_n)
+    data_merged[[paste0(v, "_L", lag_n)]] <- dplyr::lag(data_merged[[v]], lag_n)
   }
 }
 
 # remove NAs introduced by adding lags
 data_merged <- data_merged %>% filter(row_number() > 4)
-colSums(is.na(data_merged))
+
+sum(is.na(data_merged))
+#colSums(is.na(data_merged))
 
 ```
 
