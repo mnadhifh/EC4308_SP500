@@ -135,11 +135,8 @@ for (v in vars) {
 }
 
 ```
-
-
 ## Adding Lags
-``` {r}
-
+```{r}
 predictors <- setdiff(names(data_merged), c("date", "price", "log_ret"))
 
 # we choose to add 4 lags 
@@ -152,5 +149,12 @@ for (v in predictors) {
 # remove NAs introduced by adding lags
 data_merged <- data_merged %>% filter(row_number() > 4)
 colSums(is.na(data_merged))
+
+```
+
+
+``` {r}
+
+write.csv(data_merged, "../data/data_merged.csv", row.names = FALSE)
 
 ```
