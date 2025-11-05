@@ -1,0 +1,156 @@
+---
+title: "data pre-processing"
+author: "Martha"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+# SETTING UP LIBRARIES
+library(dplyr)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(dplyr)
+library(purrr)
+library(zoo)
+```
+
+
+## Loading Datasets
+```{r}
+
+# loading main data
+data = read_xlsx("../data/Data2024.xlsx", sheet = 3)
+#glimpse
+startindx <- data %>% filter(yyyyq == 19601)  #will start from 1960Q1
+
+# also for recomputation, need other external data
+# from FRED, get gdp, yields
+gdp = read_xlsx("../data/GDPC1.xlsx", sheet = 2)
+y10 = read_xlsx("../data/GS10.xlsx", sheet = 2)
+y3m = read_xlsx("../data/TB3MS.xlsx", sheet = 2)
+
+```
+
+```{r}
+gdp <- gdp %>%
+  mutate(
+    log_gdp = log(GDPC1)
+  ) %>%
+  rename(date = observation_date)
+
+# --- Step 2: Rolling (real-time) HP filter ---
+lambda_hp <- 1600  # standard for quarterly data
+
+gdp <- gdp %>%
+  mutate(
+    ogap_r = map_dbl(seq_along(log_gdp), function(i) {
+      if (i < 20) return(NA)  
+      hp <- mFilter::hpfilter(log_gdp[1:i], freq = lambda_hp)
+      tail(hp$cycle, 1)  # keep last observation (real-time gap)
+    })
+  ) %>%
+  filter(year(date) >= 1960)
+
+#head(gdp)
+
+y3m <- y3m %>%
+  filter(observation_date >= as.Date("1953-04-01"))
+
+yields <- full_join(y10, y3m, by = "observation_date") %>%
+  mutate(term_spread = GS10 - TB3MS) %>%
+  rename(date = observation_date)
+
+yields <- yields %>%
+  mutate(
+    tchi_r = map_dbl(seq_along(term_spread), function(i) {
+      if (i < 20) return(NA)
+      spread_hist <- term_spread[1:(i - 1)]
+      term_spread[i] - mean(spread_hist, na.rm = TRUE)
+    })
+  ) %>% filter(year(date) >= 1960)
+
+#head(yields)
+```
+## Preliminary Data Cleaning
+
+```{r}
+
+
+data_clean <- data %>% 
+  filter(yyyyq >= 19601) %>%  #will take data starting from 1950
+  select(where(~ !all(is.na(.)))) %>%   #remove columns which are completely empty
+  select(any_of(names(startindx)[!is.na(startindx[1, ])])) %>%  
+  mutate(
+  date = as.character(yyyyq),
+  date = as.Date(paste0(as.integer(substr(date, 1, 4)), "-", 
+                        (as.integer(substr(date, 5, 5)) - 1) * 3 + 1, "-01"))) 
+  
+# creating log returns for price adding ogap_r and tchi_r
+data_merged <- data_clean %>%
+  mutate(log_ret = log(price/lag(price))
+         ) %>%
+  left_join(select(gdp, date, ogap_r), by = "date") %>%
+  left_join(select(yields, date, tchi_r), by = "date") %>%
+  select(-any_of(c("fbm", "csp", "yyyyq", "tchi", "ogap"))) %>%
+  rename(
+    d_p = `d/p`,
+    d_y = `d/y`,
+    e_p = `e/p`,
+    d_e = `d/e`,
+    b_m = `b/m`,
+    i_k = `i/k`
+  ) 
+
+colMeans(is.na(data_merged)) * 100 #check for NA for all other variables 
+sum(duplicated(data_merged)) #check for duplicates
+```
+
+## Fractional Differencing 
+Fractional differencing done to features which are non-stationary (first checked using ADF test with threshold 0.05). Fractional differencing may provide greater benefit to the model by keeping the signal while making the feature stationary.
+``` {r}
+library(tseries)
+library(fracdiff)
+
+# Columns to test (excluding date)
+vars <- setdiff(names(data_merged), "date")
+
+for (v in vars) {
+  x <- data_merged[[v]]
+  if (sum(is.na(x)) < length(x) - 5) {  # skip mostly missing
+    test <- suppressWarnings(adf.test(na.omit(x)))
+    
+    if (test$p.value > 0.05) {
+      #cat("ADF test p-value:", test$p.value, "\n")
+
+      fd <- fracdiff(na.omit(x), nar = 0, nma = 0)
+      data_merged[[paste0(v, "_fd")]] <- diffseries(na.omit(x), d = fd$d)
+      cat(v, ": ADF p-value:", test$p.value, 
+          ", fractional differencing (d =", round(fd$d, 3), ")\n")
+    }
+  }
+}
+
+```
+
+
+## Adding Lags
+``` {r}
+
+predictors <- setdiff(names(data_merged), c("date", "price", "log_ret"))
+
+# we choose to add 4 lags 
+for (v in predictors) {
+  for (lag_n in 1:4) {
+    data_clean[[paste0(v, "_L", lag_n)]] <- dplyr::lag(data_merged[[v]], lag_n)
+  }
+}
+
+# remove NAs introduced by adding lags
+data_merged <- data_merged %>% filter(row_number() > 4)
+colSums(is.na(data_merged))
+
+```
