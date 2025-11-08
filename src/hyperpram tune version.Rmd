@@ -1,0 +1,1004 @@
+---
+title: "RF and XGBoost"
+author: "Dawn"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+
+# SETTING UP LIBRARIES
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(dplyr)
+library(purrr)
+library(zoo)
+library(Metrics)
+library(forecast)
+library(randomForest)
+library(xgboost)
+library(pdp)
+```
+
+## Loading Datasets
+```{r}
+
+data = read.csv("data/data_merged.csv")
+
+```
+
+## Benchmark Model - Prevailing Mean 
+Our first benchmark will be a prevailing mean of S&P500 returns
+```{r}
+data$date <- as.Date(data$date)
+
+window_size <- 60
+
+data <- data %>%
+  mutate(
+    mean_prevailing_ret = map_dbl(seq_along(log_ret), function(i) {
+      if (i <= window_size) return(NA_real_)
+      mean(log_ret[(i - window_size):(i - 1)], na.rm = TRUE)
+    })
+  )
+
+# Remove first rows that have NA forecast
+plot_df <- data %>% filter(!is.na(mean_prevailing_ret))
+
+# Plot
+ggplot(plot_df, aes(x = date)) +
+  geom_line(aes(y = log_ret, color = "Actual S&P 500 return")) +
+  geom_line(aes(y = mean_prevailing_ret, color = "Prevailing mean return forecast")) +
+  labs(
+    title = "S&P 500 Return Forecast: Prevailing Mean Benchmark",
+    x = "Date",
+    y = "Log Return",
+    color = ""
+  ) +
+  theme_minimal()
+```
+
+##Prevailing Mean Metrics
+```{r}
+PM_df <- data %>%
+  mutate(lag_ret = dplyr::lag(log_ret)
+  ) %>%
+  filter(!is.na(log_ret), !is.na(mean_prevailing_ret), !is.na(lag_ret)) %>%
+  mutate(
+    err_mean = log_ret - mean_prevailing_ret,  # prevailing-mean forecast errors
+    err_rw   = log_ret - lag_ret               # random-walk benchmark errors
+  )
+
+# Metrics
+MAE_mean  <- mae(PM_df$log_ret, PM_df$mean_prevailing_ret)
+RMSE_mean <- rmse(PM_df$log_ret, PM_df$mean_prevailing_ret)
+R2_mean   <- cor(PM_df$log_ret, PM_df$mean_prevailing_ret)^2
+
+cat("\n=== Prevailing Mean Return Forecast ===\n")
+cat("MAE :", round(MAE_mean, 6),
+    "\nRMSE:", round(RMSE_mean, 6),
+    "\nR²  :", round(R2_mean, 4), "\n")
+
+# Diebold–Mariano Test (Prevailing Mean vs Random Walk)
+dm_test_mean <- dm.test(
+  e1 = PM_df$err_mean,
+  e2 = PM_df$err_rw,
+  alternative = "less",  # H1: prevailing mean has lower expected loss
+  h = 1, power = 2
+)
+
+cat("\n=== DM Test: Prevailing Mean vs Lag-Return (Random Walk) ===\n")
+cat("DM Statistic:", round(as.numeric(dm_test_mean$statistic), 3),
+    "\nP-value:", signif(dm_test_mean$p.value, 4), "\n")
+
+# === Conclusion Interpretation ===
+if(dm_test_mean$p.value < 0.05) {
+  cat("\nConclusion: The p-value < 0.05 → We reject the null hypothesis.\n")
+  cat("The prevailing mean forecast has significantly lower forecast error\n")
+  cat("than the random-walk (last return) benchmark.\n")
+} else {
+  cat("\nConclusion: The p-value >= 0.05 → We fail to reject the null hypothesis.\n")
+  cat("The prevailing mean forecast does not significantly outperform\n")
+  cat("the random-walk (last return) benchmark.\n")
+}
+
+
+```
+##Random Forest with Hyperparameter Tuning
+
+# ============================================================================
+# MODELING APPROACH: Standard 80/20 Train-Test Split (NOT Rolling Window)
+# ============================================================================
+# 
+# WHY THIS APPROACH?
+# - ML models use LAGGED FEATURES (_L1, _L2, _L3, _L4)
+# - Each observation already contains 4 quarters of historical information
+# - Unlike Prevailing Mean (which needs 60-quarter windows), ML models 
+#   can be trained on ANY number of observations
+# 
+# DATA SPLIT:
+# - Training: 206 quarters (80%) for hyperparameter tuning and model training
+# - Test: 52 quarters (20%) for final out-of-sample evaluation
+# 
+# PROCESS:
+# 1. Tune hyperparameters using time-series CV within training set
+#    (165 quarters train, 41 quarters validate)
+# 2. Train final model on ALL 206 training quarters with best hyperparameters
+# 3. Predict on 52 test quarters for performance evaluation
+# 4. Compare with Prevailing Mean performance on SAME 52 test quarters
+# ============================================================================
+
+```{r}
+# Make sure sorted by time
+data <- data %>% arrange(date)
+
+# Build RF feature matrix: log_ret + lagged predictors *_L1..*_L4
+# We use lagged predictors because our goal is real-time forecasting. Using only lagged values ensures the model never uses information that would not be available at the time of prediction, preventing look-ahead bias and producing realistic out-of-sample performance.
+
+rf_features <- data %>%
+  select(
+    date,
+    log_ret,
+    matches("_L[1-4]$")
+  )
+
+# Drop rows missing any predictors (early periods)
+rf_df <- rf_features %>% drop_na()
+
+set.seed(123)
+
+# ========== 80/20 TRAIN-TEST SPLIT ==========
+# Total: 258 quarters
+# Train: 206 quarters (80%) for hyperparameter tuning
+# Test:  52 quarters (20%) for final evaluation
+n <- nrow(rf_df)
+train_size <- floor(0.8 * n)  # 206 quarters
+test_size <- n - train_size    # 52 quarters
+
+cat("\n=== Data Split ===\n")
+cat("Total observations:", n, "\n")
+cat("Training set:", train_size, "quarters (80%)\n")
+cat("Test set:", test_size, "quarters (20%)\n\n")
+
+# Split data
+train_data <- rf_df[1:train_size, ]
+test_data <- rf_df[(train_size + 1):n, ]
+
+# Initialize predictions
+rf_pred <- rep(NA_real_, n)
+
+# ========== HYPERPARAMETER TUNING SETUP ==========
+# We tune hyperparameters on the training set (206 quarters total)
+# Then use best parameters to train final model on all 206 quarters
+
+# VALIDATION STRATEGY: Time-Series Cross-Validation
+# We split the 206-quarter training set temporally:
+#   - Train: Q1-Q165 (165 quarters, 80% of training data)
+#   - Validate: Q166-Q206 (41 quarters, 20% of training data)
+# This respects temporal order and gives realistic performance estimates!
+
+# Define hyperparameter grid for Random Forest
+#Our training data has 165 observations and 280+ features
+# With n=165 and p=280, we still have p > n, so careful tuning is needed!
+
+# WHY THESE RANGES?
+#
+# mtry = [10, 20, 30, 40, 50, 60]  (features considered per split)
+#   → Range 10-60 spans from conservative to moderate (not too aggressive since p > n)
+#
+# nodesize = [1, 3, 5, 10]  (minimum observations in leaf nodes)
+#   → Controls tree depth/complexity inversely (smaller = deeper trees)
+#   → nodesize=1: very deep trees (most flexible, but may overfit)
+#   → nodesize=10: shallower trees (more regularization)
+#   → Smaller nodesizes are now more reasonable with 165 observations
+#
+# ntree = 300  (number of trees) - FIXED
+#   → More data allows us to use more trees for better averaging
+#   → Based on OOB error analysis (will check convergence)
+#   → Random Forest is robust to this choice (more trees rarely hurt)
+#   → With 165 observations (vs previous 60), we can afford 300 trees 
+
+rf_param_grid <- expand.grid(
+  mtry = c(10, 20, 30, 40, 50, 60),       # Feature sampling (MOST IMPORTANT)
+  nodesize = c(1, 3, 5, 10),              # Tree complexity / regularization
+  ntree = 300                              # Fixed (can afford more with 165 obs)
+)
+# Grid size: 6 × 4 × 1 = 24 combinations (still very manageable)
+
+cat("\n=== Random Forest Hyperparameter Tuning ===\n")
+cat("Tuning on training set with time-series validation split...\n")
+cat("Grid size:", nrow(rf_param_grid), "combinations\n\n")
+
+# Split training data for hyperparameter tuning
+# 80% of training set (165 quarters) for training
+# 20% of training set (41 quarters) for validation
+train_tune_size <- floor(0.8 * train_size)  # 165 quarters
+val_tune_size <- train_size - train_tune_size  # 41 quarters
+
+cat("Hyperparameter tuning split:\n")
+cat("  Training:", train_tune_size, "quarters (Q1-Q165)\n")
+cat("  Validation:", val_tune_size, "quarters (Q166-Q206)\n\n")
+
+X_train_tune <- train_data[1:train_tune_size, ] %>% select(-date, -log_ret)
+y_train_tune <- train_data$log_ret[1:train_tune_size]
+
+X_val_tune <- train_data[(train_tune_size+1):train_size, ] %>% select(-date, -log_ret)
+y_val_tune <- train_data$log_ret[(train_tune_size+1):train_size]
+
+# Tune hyperparameters using time-series validation
+best_val_rmse <- Inf
+best_params_rf <- NULL
+
+for (i in 1:nrow(rf_param_grid)) {
+  
+  # Train RF on training portion (Q1-Q165)
+  temp_rf <- randomForest(
+    x = X_train_tune,
+    y = y_train_tune,
+    ntree = rf_param_grid$ntree[i],
+    mtry = rf_param_grid$mtry[i],
+    nodesize = rf_param_grid$nodesize[i],
+    keep.forest = TRUE  # Need forest to make predictions
+  )
+  
+  # Validate on validation portion (Q166-Q206)
+  # This is realistic: using only past to predict future
+  val_preds <- predict(temp_rf, newdata = X_val_tune)
+  current_val_rmse <- sqrt(mean((y_val_tune - val_preds)^2))
+  
+  # Track best combination
+  if (current_val_rmse < best_val_rmse) {
+    best_val_rmse <- current_val_rmse
+    best_params_rf <- rf_param_grid[i, ]
+  }
+}
+
+# Report best hyperparameters
+cat("\n=== Best Random Forest Hyperparameters (via Time-Series CV) ===\n")
+cat("Validation split: Train on Q1-Q165, validate on Q166-Q206\n")
+cat("mtry     :", best_params_rf$mtry, "\n")
+cat("nodesize :", best_params_rf$nodesize, "\n")
+cat("ntree    :", best_params_rf$ntree, "\n")
+cat("Best Val RMSE:", round(best_val_rmse, 6), "\n\n")
+
+# ========== TRAIN FINAL MODEL AND PREDICT TEST SET ==========
+cat("\n=== Training Final Random Forest Model ===\n")
+cat("Training on full training set (206 quarters) with optimized hyperparameters...\n")
+
+# Prepare full training data
+X_train_full <- train_data %>% select(-date, -log_ret)
+y_train_full <- train_data$log_ret
+
+# Train final model on ALL training data
+final_rf_model <- randomForest(
+  x = X_train_full,
+  y = y_train_full,
+  ntree = best_params_rf$ntree,
+  mtry = best_params_rf$mtry,
+  nodesize = best_params_rf$nodesize,
+  keep.forest = TRUE,
+  importance = TRUE  # For feature importance analysis
+)
+
+cat("Training complete!\n")
+
+# ========== PREDICT ON TEST SET ==========
+cat("\n=== Generating Predictions on Test Set ===\n")
+cat("Predicting", test_size, "quarters (Q207-Q258)...\n")
+
+X_test_full <- test_data %>% select(-date, -log_ret)
+y_test_full <- test_data$log_ret
+
+# Generate predictions
+test_predictions <- predict(final_rf_model, newdata = X_test_full)
+
+# Store predictions in the full dataframe
+rf_pred[(train_size + 1):n] <- test_predictions
+
+# Attach forecasts to dataframe
+rf_df$rf_forecast_ret <- rf_pred
+
+# Store final model for interpretation
+last_rf_model <- final_rf_model
+last_X_train <- X_train_full
+
+cat("Prediction complete!\n")
+
+```
+
+```{r}
+# Join RF forecasts to actual returns and prevailing mean benchmark
+plot_rf_df <- rf_df %>%
+  left_join(
+    data %>% select(date, log_ret, mean_prevailing_ret),
+    by = "date"
+  )
+
+# ONLY PLOT TEST SET (last 52 quarters)
+plot_rf_df_test <- plot_rf_df %>%
+  tail(test_size)
+
+ggplot(plot_rf_df_test, aes(x = date)) +
+  geom_line(aes(y = log_ret.x,             color = "Actual returns")) +
+  geom_line(aes(y = mean_prevailing_ret, color = "Prevailing-mean forecast")) +
+  geom_line(aes(y = rf_forecast_ret,     color = "Random Forest forecast")) +
+  labs(
+    title = "S&P 500 Log Return Forecasts: RF vs Prevailing Mean vs Actual (TEST SET)",
+    subtitle = paste("Test period:", test_size, "quarters (Q207-Q258)"),
+    x = "Year",
+    y = "Log Return",
+    color = ""
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r}
+# EVALUATE ONLY ON TEST SET
+rf_eval_df <- plot_rf_df %>%
+  tail(test_size) %>%  # Only last 52 quarters (test set)
+  filter(
+    !is.na(log_ret.x),
+    !is.na(rf_forecast_ret),
+    !is.na(mean_prevailing_ret)
+  ) %>%
+  mutate(
+    err_rf   = log_ret.x - rf_forecast_ret,
+    err_mean = log_ret.x - mean_prevailing_ret
+  )
+
+cat("\n=== TEST SET PERFORMANCE (Q207-Q258, n =", nrow(rf_eval_df), "quarters) ===\n\n")
+
+# MAE, RMSE, R²
+MAE_rf  <- mae(rf_eval_df$log_ret.x, rf_eval_df$rf_forecast_ret)
+RMSE_rf <- rmse(rf_eval_df$log_ret.x, rf_eval_df$rf_forecast_ret)
+R2_rf   <- cor(rf_eval_df$log_ret.x, rf_eval_df$rf_forecast_ret)^2
+
+cat("=== Random Forest Forecast Performance ===\n")
+cat("MAE :", round(MAE_rf, 6),
+    "\nRMSE:", round(RMSE_rf, 6),
+    "\nR²  :", round(R2_rf, 4))
+
+#DM Test
+dm_test_rf <- dm.test(
+  e1 = rf_eval_df$err_rf,
+  e2 = rf_eval_df$err_mean,
+  alternative = "less"   # H1: RF has lower expected error
+)
+
+cat("\n\n=== DM Test: Random Forest VS Prevailing Mean ===\n")
+cat("DM Statistic:", round(as.numeric(dm_test_rf$statistic), 3),
+    "\nP-value:", signif(dm_test_rf$p.value, 4), "\n")
+
+# === Conclusion Interpretation ===
+if(dm_test_rf$p.value < 0.05) {
+  cat("\nConclusion: The p-value < 0.05 → We reject the null hypothesis.\n")
+  cat("Random Forest has significantly lower forecast error\n")
+  cat("than the Prevailing Mean model.\n")
+} else {
+  cat("\nConclusion: The p-value >= 0.05 → We fail to reject the null hypothesis.\n")
+  cat("Random Forest does not significantly outperform\n")
+  cat("the Prevailing Mean Model.\n")
+}
+```
+##Feature Importance Plot
+```{r}
+# Extract importance values from final RF model (already stored as last_rf_model)
+imp <- importance(last_rf_model)
+
+# Convert to clean dataframe
+imp_df <- data.frame(
+  Feature = rownames(imp),
+  Importance = imp[, 1]   # %IncMSE for regression
+)
+
+# Select Top 10 features to display in the plot
+imp_top10 <- imp_df %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = 10)
+
+ggplot(imp_top10, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Feature Importance (%IncMSE)",
+    x = "Predictor (Lagged Features)",
+    y = "Importance"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(face = "bold")
+  )
+
+```
+##PDP Plot
+```{r}
+top3 <- imp_top10$Feature[1:3]
+
+for (feat in top3) {
+  pd <- partial(
+    last_rf_model,
+    pred.var = feat,
+    train = last_X_train,
+    grid.resolution = 40
+  )
+  
+  p <- autoplot(pd) +
+    labs(
+      title = paste("Partial Dependence Plot:", feat),
+      x = feat,
+      y = "Effect on Predicted Return"
+    ) +
+    theme_minimal()
+  
+  print(p)
+}
+
+```
+##OOB Error
+```{r}
+plot(last_rf_model, main = "OOB Error vs Number of Trees (Random Forest)")
+```
+##From the plot, we see that Eeror drops quickly in the first ~50–80 trees, and the curve flattens and stabilizes around 100–150 trees. Afteraround 150 trees, the OOB error does not meaningfully decrease anymore.From around 150 to 500 trees, the model is basically just averaging noise (flat tail). So, adding more trees beyond ~150 does not improve accuracy. Hence, we conclude that we could have choosen about 200 trees for a stable and low variance random forest model.
+
+##XGBoost with Hyperparameter Tuning
+```{r}
+
+# Use same train/test split as Random Forest
+# train_data and test_data already defined (206 / 52 split)
+
+xgb_pred <- rep(NA_real_, n)
+
+# ========== HYPERPARAMETER TUNING SETUP ==========
+# XGBoost has no OOB error, so we use time-series cross-validation
+# Strategy: Split training set (206 quarters) into train (165) + validation (41)
+
+
+
+# 
+# max_depth = [3, 4, 5, 6]
+#   → Tree depth. With 165 training observations, we can afford deeper trees
+
+#   → Range 3-6 balances model capacity with overfitting risk
+#   → Still keeping it moderate since we have p > n (280 features > 165 obs)
+#
+# eta = [0.01, 0.05, 0.1]  (learning rate)
+#   → Controls how much each tree contributes. Lower = more conservative
+#   → 0.01-0.1 provides good range from conservative to moderate
+#   → Lower values require more rounds but often generalize better
+#
+# nrounds = [100, 200, 300]  (boosting iterations)
+#   → Number of trees to build sequentially
+#   → With 165 observations, we can afford more iterations
+#   → Early stopping will find optimal point automatically
+#
+# subsample = [0.7, 0.8, 0.9]  (row/observation sampling)
+#   → Fraction of observations used per tree
+#   → 0.7 = 116 obs, 0.8 = 132 obs, 0.9 = 149 obs (out of 165 training quarters)
+
+#   
+#
+# colsample_bytree = [0.6, 0.7, 0.8]  (feature sampling)
+#   → Fraction of features used per tree
+#   → 0.6 = 168 features, 0.7 = 196 features, 0.8 = 224 features (out of 280)
+
+
+
+xgb_param_grid <- expand.grid(
+  max_depth = c(3, 4, 5, 6),              # Tree depth: moderate for n=165
+  eta = c(0.01, 0.05, 0.1),               # Learning rate: conservative to moderate
+  nrounds = c(100, 200, 300),             # Iterations: allow more with larger data
+  subsample = c(0.7, 0.8, 0.9),           # Row sampling: can use more with n=165
+  colsample_bytree = c(0.6, 0.7, 0.8)     # Feature sampling: regularization for p>n
+)
+# Grid size: 4 × 3 × 3 × 3 × 3 = 324 combinations
+# Note: This is larger than before, but more thorough hyperparameter search
+# With early stopping, each combination trains efficiently
+
+cat("\n=== XGBoost Hyperparameter Tuning ===\n")
+cat("Tuning on training set with time-series validation split...\n")
+cat("Grid size:", nrow(xgb_param_grid), "combinations\n\n")
+
+# Split training data for hyperparameter tuning (same as RF)
+# 80% of training set (165 quarters) for training
+# 20% of training set (41 quarters) for validation
+cat("Hyperparameter tuning split:\n")
+cat("  Training:", train_tune_size, "quarters (Q1-Q165)\n")
+cat("  Validation:", val_tune_size, "quarters (Q166-Q206)\n\n")
+
+X_train_tune_xgb <- train_data[1:train_tune_size, ] %>% select(-date, -log_ret)
+y_train_tune_xgb <- train_data$log_ret[1:train_tune_size]
+
+X_val_tune_xgb <- train_data[(train_tune_size+1):train_size, ] %>% select(-date, -log_ret)
+y_val_tune_xgb <- train_data$log_ret[(train_tune_size+1):train_size]
+
+# Convert to DMatrix
+dtrain_tune <- xgb.DMatrix(data = as.matrix(X_train_tune_xgb), label = y_train_tune_xgb)
+dval_tune   <- xgb.DMatrix(data = as.matrix(X_val_tune_xgb), label = y_val_tune_xgb)
+
+# Tune hyperparameters using validation set
+best_val_rmse_xgb <- Inf
+best_params_xgb <- NULL
+
+for (i in 1:nrow(xgb_param_grid)) {
+  
+  # Current parameter combination
+  params <- list(
+    objective = "reg:squarederror",
+    max_depth = xgb_param_grid$max_depth[i],
+    eta = xgb_param_grid$eta[i],
+    subsample = xgb_param_grid$subsample[i],
+    colsample_bytree = xgb_param_grid$colsample_bytree[i]
+  )
+  
+  # Train XGBoost with watchlist to monitor validation error
+  temp_xgb <- xgb.train(
+    params = params,
+    data = dtrain_tune,
+    nrounds = xgb_param_grid$nrounds[i],
+    watchlist = list(train = dtrain_tune, val = dval_tune),
+    verbose = 0,  # Suppress output during tuning
+    early_stopping_rounds = 20  # Stop if no improvement for 20 rounds
+  )
+  
+  # Get validation RMSE (lower is better)
+  val_preds <- predict(temp_xgb, dval_tune)
+  current_val_rmse <- sqrt(mean((y_val_tune_xgb - val_preds)^2))
+  
+  # Track best combination
+  if (current_val_rmse < best_val_rmse_xgb) {
+    best_val_rmse_xgb <- current_val_rmse
+    best_params_xgb <- xgb_param_grid[i, ]
+    best_nrounds <- temp_xgb$best_iteration  # Actual optimal rounds (with early stopping)
+  }
+}
+
+# Report best hyperparameters
+cat("\n=== Best XGBoost Hyperparameters (via Time-Series CV) ===\n")
+cat("Validation split: Train on Q1-Q165, validate on Q166-Q206\n")
+cat("All 5 parameters below were tuned via grid search:\n")
+cat("max_depth       :", best_params_xgb$max_depth, "\n")
+cat("eta             :", best_params_xgb$eta, "\n")
+cat("nrounds         :", best_nrounds, "(early stopped from", best_params_xgb$nrounds, ")\n")
+cat("subsample       :", best_params_xgb$subsample, "\n")
+cat("colsample_bytree:", best_params_xgb$colsample_bytree, "\n")
+cat("Best Val RMSE   :", round(best_val_rmse_xgb, 6), "\n\n")
+
+# ========== TRAIN FINAL MODEL AND PREDICT TEST SET ==========
+cat("\n=== Training Final XGBoost Model ===\n")
+cat("Training on full training set (206 quarters) with optimized hyperparameters...\n")
+
+# Prepare full training data
+X_train_full_xgb <- train_data %>% select(-date, -log_ret)
+y_train_full_xgb <- train_data$log_ret
+
+# Convert to DMatrix
+dtrain_full <- xgb.DMatrix(data = as.matrix(X_train_full_xgb), label = y_train_full_xgb)
+
+# Train final model on ALL training data with best parameters
+params_final <- list(
+  objective = "reg:squarederror",
+  max_depth = best_params_xgb$max_depth,
+  eta = best_params_xgb$eta,
+  subsample = best_params_xgb$subsample,
+  colsample_bytree = best_params_xgb$colsample_bytree
+)
+
+final_xgb_model <- xgb.train(
+  params = params_final,
+  data = dtrain_full,
+  nrounds = best_nrounds,  # Use optimal number of rounds from tuning
+  verbose = 0
+)
+
+cat("Training complete!\n")
+
+# ========== PREDICT ON TEST SET ==========
+cat("\n=== Generating Predictions on Test Set ===\n")
+cat("Predicting", test_size, "quarters (Q207-Q258)...\n")
+
+X_test_full_xgb <- test_data %>% select(-date, -log_ret)
+dtest_full <- xgb.DMatrix(data = as.matrix(X_test_full_xgb))
+
+# Generate predictions
+test_predictions_xgb <- predict(final_xgb_model, dtest_full)
+
+# Store predictions in the full dataframe
+xgb_pred[(train_size + 1):n] <- test_predictions_xgb
+
+# Attach forecasts to dataframe
+rf_df$xgb_forecast_ret <- xgb_pred
+
+# Store final model and data for interpretation
+last_xgb_model   <- final_xgb_model
+last_X_train_xgb <- X_train_full_xgb
+last_feat_names  <- colnames(last_X_train_xgb)
+
+cat("Prediction complete!\n")
+
+```
+
+```{r}
+
+plot_xgb_df <- rf_df %>%
+  left_join(
+    data %>% select(date, log_ret, mean_prevailing_ret),
+    by = "date"
+  )
+
+# ONLY PLOT TEST SET (last 52 quarters)
+plot_xgb_df_test <- plot_xgb_df %>%
+  tail(test_size)
+
+ggplot(plot_xgb_df_test, aes(x = date)) +
+  geom_line(aes(y = log_ret.x,            color = "Actual returns")) +
+  geom_line(aes(y = mean_prevailing_ret, color = "Prevailing-mean forecast")) +
+  geom_line(aes(y = xgb_forecast_ret,    color = "XGBoost forecast")) +
+  labs(
+    title = "S&P 500 Log Return Forecasts: XGBoost vs Prevailing Mean vs Actual (TEST SET)",
+    subtitle = paste("Test period:", test_size, "quarters (Q207-Q258)"),
+    x = "Year",
+    y = "Log Return",
+    color = ""
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# EVALUATE ONLY ON TEST SET
+xgb_eval_df <- plot_xgb_df %>%
+  tail(test_size) %>%  # Only last 52 quarters (test set)
+  filter(
+    !is.na(log_ret.x),
+    !is.na(xgb_forecast_ret),
+    !is.na(mean_prevailing_ret)
+  ) %>%
+  mutate(
+    err_xgb   = log_ret.x - xgb_forecast_ret,
+    err_mean = log_ret.x - mean_prevailing_ret
+  )
+
+cat("\n=== TEST SET PERFORMANCE (Q207-Q258, n =", nrow(xgb_eval_df), "quarters) ===\n\n")
+
+# MAE, RMSE, R²
+MAE_xgb  <- mae(xgb_eval_df$log_ret.x, xgb_eval_df$xgb_forecast_ret)
+RMSE_xgb <- rmse(xgb_eval_df$log_ret.x, xgb_eval_df$xgb_forecast_ret)
+R2_xgb   <- cor(xgb_eval_df$log_ret.x, xgb_eval_df$xgb_forecast_ret)^2
+
+cat("=== XGBoost Forecast Performance ===\n")
+cat("MAE :", round(MAE_xgb, 6),
+    "\nRMSE:", round(RMSE_xgb, 6),
+    "\nR²  :", round(R2_xgb, 4))
+
+#DM Test
+dm_test_xgb <- dm.test(
+  e1 = xgb_eval_df$err_xgb,
+  e2 = xgb_eval_df$err_mean,
+  alternative = "less"   # H1: XGBoost has lower expected error
+)
+
+cat("\n\n=== DM Test: XGBoost VS Prevailing Mean ===\n")
+cat("DM Statistic:", round(as.numeric(dm_test_xgb$statistic), 3),
+    "\nP-value:", signif(dm_test_xgb$p.value, 4), "\n")
+
+# === Conclusion Interpretation ===
+if(dm_test_xgb$p.value < 0.05) {
+  cat("\nConclusion: The p-value < 0.05 → We reject the null hypothesis.\n")
+  cat("XGBoost has significantly lower forecast error\n")
+  cat("than the Prevailing Mean model.\n")
+} else {
+  cat("\nConclusion: The p-value >= 0.05 → We fail to reject the null hypothesis.\n")
+  cat("XGBoost does not significantly outperform\n")
+  cat("the Prevailing Mean Model.\n")
+}
+```
+
+##Feature Importance
+```{r}
+# Feature importance (Top 10 by Gain)
+imp_tbl <- xgb.importance(model = last_xgb_model, feature_names = last_feat_names)
+
+imp_top10 <- imp_tbl %>%
+  dplyr::slice_max(order_by = Gain, n = 10) %>%
+  dplyr::mutate(Feature = factor(Feature, levels = rev(Feature)))
+
+ggplot(imp_top10, aes(x = Feature, y = Gain)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "XGBoost Feature Importance (Top 10)",
+       x = "Feature", y = "Gain") +
+  theme_minimal()
+
+```
+
+##PDP
+```{r}
+# top-3 from the top10 list
+top3_xgb <- imp_top10$Feature[1:3]
+
+# predict wrapper for pdp
+xgb_pred_fun <- function(object, newdata) {
+  predict(object, newdata = xgb.DMatrix(as.matrix(newdata)))
+}
+
+for (feat in top3_xgb) {
+
+  pd <- partial(
+    object = last_xgb_model,
+    pred.var = feat,
+    train = last_X_train_xgb,
+    pred.fun = xgb_pred_fun,
+    grid.resolution = 100,   # smoother curve
+    ice = FALSE             
+  )
+  
+  p <- autoplot(pd) +
+    labs(
+      title = paste("PDP:", feat),
+      x = feat,
+      y = "Effect on Predicted Return"
+    ) +
+    theme_minimal()
+  
+  print(p)
+}
+
+```
+
+## Model Comparison: Test Set Performance
+```{r}
+# ============================================================================
+# COMPREHENSIVE MODEL COMPARISON ON TEST SET
+# ============================================================================
+# Compare all three models on the same test period (Q207-Q258, 52 quarters)
+# This ensures a fair apples-to-apples comparison
+
+cat("  COMPREHENSIVE MODEL COMPARISON: TEST SET PERFORMANCE\n")
+cat("  Test Period: Q207-Q258 (52 quarters, ~13 years)\n")
+cat("  Training Period: Q1-Q206 (206 quarters for ML models)\n")
+
+
+# Prepare comparison dataframe with all three models on test set
+comparison_df <- rf_df %>%
+  left_join(
+    data %>% select(date, log_ret, mean_prevailing_ret),
+    by = "date"
+  ) %>%
+  tail(test_size) %>%  # Only test set
+  filter(
+    !is.na(log_ret.x),
+    !is.na(mean_prevailing_ret),
+    !is.na(rf_forecast_ret),
+    !is.na(xgb_forecast_ret)
+  ) %>%
+  mutate(
+    # Forecast errors for each model
+    err_prevailing = log_ret.x - mean_prevailing_ret,
+    err_rf = log_ret.x - rf_forecast_ret,
+    err_xgb = log_ret.x - xgb_forecast_ret
+  )
+
+# ========== PERFORMANCE METRICS TABLE ==========
+# Calculate all metrics
+metrics_summary <- data.frame(
+  Model = c("Prevailing Mean (Benchmark)", "Random Forest (Tuned)", "XGBoost (Tuned)"),
+  
+  MAE = c(
+    mae(comparison_df$log_ret.x, comparison_df$mean_prevailing_ret),
+    mae(comparison_df$log_ret.x, comparison_df$rf_forecast_ret),
+    mae(comparison_df$log_ret.x, comparison_df$xgb_forecast_ret)
+  ),
+  
+  RMSE = c(
+    rmse(comparison_df$log_ret.x, comparison_df$mean_prevailing_ret),
+    rmse(comparison_df$log_ret.x, comparison_df$rf_forecast_ret),
+    rmse(comparison_df$log_ret.x, comparison_df$xgb_forecast_ret)
+  ),
+  
+  R_squared = c(
+    cor(comparison_df$log_ret.x, comparison_df$mean_prevailing_ret)^2,
+    cor(comparison_df$log_ret.x, comparison_df$rf_forecast_ret)^2,
+    cor(comparison_df$log_ret.x, comparison_df$xgb_forecast_ret)^2
+  )
+)
+
+# Print formatted table
+cat("PERFORMANCE METRICS (Test Set: n =", nrow(comparison_df), "quarters)\n")
+cat(rep("-", 80), "\n")
+print(metrics_summary, row.names = FALSE, digits = 6)
+cat(rep("-", 80), "\n\n")
+
+# ========== IDENTIFY BEST MODEL ==========
+best_mae_idx <- which.min(metrics_summary$MAE)
+best_rmse_idx <- which.min(metrics_summary$RMSE)
+best_r2_idx <- which.max(metrics_summary$R_squared)
+
+cat("BEST PERFORMANCE:\n")
+cat("  Lowest MAE  :", metrics_summary$Model[best_mae_idx], 
+    "(", round(metrics_summary$MAE[best_mae_idx], 6), ")\n")
+cat("  Lowest RMSE :", metrics_summary$Model[best_rmse_idx], 
+    "(", round(metrics_summary$RMSE[best_rmse_idx], 6), ")\n")
+cat("  Highest R²  :", metrics_summary$Model[best_r2_idx], 
+    "(", round(metrics_summary$R_squared[best_r2_idx], 4), ")\n\n")
+
+# ========== RELATIVE IMPROVEMENT OVER BENCHMARK ==========
+cat("IMPROVEMENT OVER PREVAILING MEAN BENCHMARK:\n")
+cat(rep("-", 80), "\n")
+
+rf_mae_improvement <- (metrics_summary$MAE[1] - metrics_summary$MAE[2]) / metrics_summary$MAE[1] * 100
+xgb_mae_improvement <- (metrics_summary$MAE[1] - metrics_summary$MAE[3]) / metrics_summary$MAE[1] * 100
+
+rf_rmse_improvement <- (metrics_summary$RMSE[1] - metrics_summary$RMSE[2]) / metrics_summary$RMSE[1] * 100
+xgb_rmse_improvement <- (metrics_summary$RMSE[1] - metrics_summary$RMSE[3]) / metrics_summary$RMSE[1] * 100
+
+cat("Random Forest:\n")
+cat("  MAE improvement : ", sprintf("%+.2f%%", rf_mae_improvement), 
+    ifelse(rf_mae_improvement > 0, " (better)", " (worse)"), "\n")
+cat("  RMSE improvement: ", sprintf("%+.2f%%", rf_rmse_improvement), 
+    ifelse(rf_rmse_improvement > 0, " (better)", " (worse)"), "\n\n")
+
+cat("XGBoost:\n")
+cat("  MAE improvement : ", sprintf("%+.2f%%", xgb_mae_improvement), 
+    ifelse(xgb_mae_improvement > 0, " (better)", " (worse)"), "\n")
+cat("  RMSE improvement: ", sprintf("%+.2f%%", xgb_rmse_improvement), 
+    ifelse(xgb_rmse_improvement > 0, " (better)", " (worse)"), "\n\n")
+
+# ========== DIEBOLD-MARIANO TESTS ==========
+cat("DIEBOLD-MARIANO STATISTICAL TESTS:\n")
+cat(rep("-", 80), "\n")
+
+# Test 1: RF vs Prevailing Mean
+dm_rf_vs_pm <- dm.test(
+  e1 = comparison_df$err_rf,
+  e2 = comparison_df$err_prevailing,
+  alternative = "less",  # H1: RF has lower loss
+  h = 1, power = 2
+)
+
+cat("1. Random Forest vs Prevailing Mean:\n")
+cat("   DM Statistic:", round(dm_rf_vs_pm$statistic, 4), "\n")
+cat("   P-value     :", signif(dm_rf_vs_pm$p.value, 4), "\n")
+cat("   Result      :", 
+    ifelse(dm_rf_vs_pm$p.value < 0.05, 
+           "RF significantly outperforms Prevailing Mean ✓",
+           "No significant difference"),
+    "\n\n")
+
+# Test 2: XGBoost vs Prevailing Mean
+dm_xgb_vs_pm <- dm.test(
+  e1 = comparison_df$err_xgb,
+  e2 = comparison_df$err_prevailing,
+  alternative = "less",  # H1: XGBoost has lower loss
+  h = 1, power = 2
+)
+
+cat("2. XGBoost vs Prevailing Mean:\n")
+cat("   DM Statistic:", round(dm_xgb_vs_pm$statistic, 4), "\n")
+cat("   P-value     :", signif(dm_xgb_vs_pm$p.value, 4), "\n")
+cat("   Result      :", 
+    ifelse(dm_xgb_vs_pm$p.value < 0.05, 
+           "XGBoost significantly outperforms Prevailing Mean ✓",
+           "No significant difference"),
+    "\n\n")
+
+# Test 3: RF vs XGBoost
+dm_rf_vs_xgb <- dm.test(
+  e1 = comparison_df$err_rf,
+  e2 = comparison_df$err_xgb,
+  alternative = "two.sided",  # H1: Different performance
+  h = 1, power = 2
+)
+
+cat("3. Random Forest vs XGBoost:\n")
+cat("   DM Statistic:", round(dm_rf_vs_xgb$statistic, 4), "\n")
+cat("   P-value     :", signif(dm_rf_vs_xgb$p.value, 4), "\n")
+cat("   Result      :", 
+    ifelse(dm_rf_vs_xgb$p.value < 0.05, 
+           ifelse(dm_rf_vs_xgb$statistic < 0,
+                  "RF significantly outperforms XGBoost ✓",
+                  "XGBoost significantly outperforms RF ✓"),
+           "No significant difference between RF and XGBoost"),
+    "\n\n")
+
+# ========== VISUAL COMPARISON ==========
+cat(rep("=", 80), "\n")
+cat("VISUAL COMPARISON PLOT GENERATED BELOW\n")
+cat(rep("=", 80), "\n\n")
+
+# Reshape data for plotting
+comparison_long <- comparison_df %>%
+  select(date, log_ret.x, mean_prevailing_ret, rf_forecast_ret, xgb_forecast_ret) %>%
+  rename(
+    Actual = log_ret.x,
+    `Prevailing Mean` = mean_prevailing_ret,
+    `Random Forest` = rf_forecast_ret,
+    XGBoost = xgb_forecast_ret
+  ) %>%
+  pivot_longer(
+    cols = -date,
+    names_to = "Model",
+    values_to = "Return"
+  ) %>%
+  mutate(
+    Model = factor(Model, levels = c("Actual", "Prevailing Mean", "Random Forest", "XGBoost"))
+  )
+
+# Time series comparison plot
+ggplot(comparison_long, aes(x = date, y = Return, color = Model)) +
+  geom_line(aes(linetype = Model), linewidth = 0.7) +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted", "dotdash")) +
+  scale_color_manual(values = c("black", "blue", "red", "darkgreen")) +
+  labs(
+    title = "Model Comparison: Test Set Forecasts (Q207-Q258)",
+    subtitle = paste("Test period:", test_size, "quarters | All models evaluated on same out-of-sample data"),
+    x = "Date",
+    y = "Log Return",
+    color = "Model",
+    linetype = "Model"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10)
+  )
+
+```
+
+## Error Distribution Comparison
+```{r}
+# Compare error distributions across models
+error_comparison <- comparison_df %>%
+  select(date, err_prevailing, err_rf, err_xgb) %>%
+  rename(
+    `Prevailing Mean` = err_prevailing,
+    `Random Forest` = err_rf,
+    XGBoost = err_xgb
+  ) %>%
+  pivot_longer(
+    cols = -date,
+    names_to = "Model",
+    values_to = "Error"
+  )
+
+# Boxplot comparison
+ggplot(error_comparison, aes(x = Model, y = Error, fill = Model)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  scale_fill_manual(values = c("blue", "red", "darkgreen")) +
+  labs(
+    title = "Forecast Error Distribution Comparison (Test Set)",
+    subtitle = "Lower spread and median closer to zero indicates better performance",
+    x = "Model",
+    y = "Forecast Error (Actual - Predicted)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+# Summary statistics of errors
+cat("\nFORECAST ERROR STATISTICS:\n")
+cat(rep("-", 80), "\n")
+
+error_stats <- error_comparison %>%
+  group_by(Model) %>%
+  summarise(
+    Mean = mean(Error),
+    Median = median(Error),
+    SD = sd(Error),
+    Min = min(Error),
+    Max = max(Error),
+    IQR = IQR(Error)
+  )
+
+print(error_stats, digits = 6)
+
+```
+
