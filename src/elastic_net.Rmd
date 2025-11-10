@@ -1,8 +1,8 @@
 ---
-title: "Ridge Regression"
+title: "Elastic Net Regression"
 author: "marth"
 output: html_document
-date: "2025-11-10"
+date: "2025-11-11"
 ---
 
 ```{r setup, include=FALSE}
@@ -40,7 +40,7 @@ data <- data %>%
 
 ```
 
-## Ridge Regression Model
+## Elastic Net Regression Model
 
 # ============================================================================
 # MODELING APPROACH: 80/20 Train-Test Split w/ Recursive CV
@@ -49,14 +49,14 @@ data <- data %>%
 ```{r}
 # --- STEP 1: Prepare data ---
 
-ridge_df <- data %>%
+enet_df <- data %>%
   arrange(date) %>%
   select(-mean_prevailing_ret) %>%
   drop_na()
 
 set.seed(123)
 
-n <- nrow(ridge_df)
+n <- nrow(enet_df)
 train_size <- floor(0.8 * n)  # 80% training
 test_size <- n - train_size   # 20% testing
 
@@ -64,8 +64,8 @@ cat("\n=== Data Split ===\n")
 cat("Training:", train_size, "observations\n")
 cat("Testing :", test_size, "observations\n")
 
-train_data <- ridge_df[1:train_size, ]
-test_data  <- ridge_df[(train_size + 1):n, ]
+train_data <- enet_df[1:train_size, ]
+test_data  <- enet_df[(train_size + 1):n, ]
 
 # Extract features and target
 X_train <- train_data %>% select(-date, -log_ret) %>% as.matrix()
@@ -86,21 +86,16 @@ cat("\nFeatures in model:", ncol(X_train), "\n")
 # BIC(λ) = log(RSS(λ)) + (log(T)/T)·df(λ)
 # ============================================================================
 
-# Function 1: Compute degrees of freedom for Ridge Regression
-# df(λ) = Σ_i d_i^2/(d_i^2+λ) where d_i are singular values of standardized X
-compute_ridge_df <- function(X_standardized, lambda) {
-  # Singular value decomposition
-  svd_result <- svd(X_standardized)
-  d <- svd_result$d  # singular values
-  
-  # df(λ) = sum(d_i^2 / (d_i^2 + λ))
-  df <- sum((d^2) / (d^2 + lambda))
-  
+# Function 1: Compute degrees of freedom for Elastic Net
+# df(λ) = number of non-zero coefficients (similar to LASSO)
+compute_enet_df <- function(coef_matrix) {
+  # Count non-zero coefficients (excluding intercept)
+  df <- sum(coef_matrix != 0)
   return(df)
 }
 
-# Function 2: Fit Ridge Regression and compute BIC for each lambda
-fit_ridge_bic <- function(X, y, alpha = 0, lambdas = NULL) {
+# Function 2: Fit Elastic Net Regression and compute BIC for each lambda
+fit_enet_bic <- function(X, y, alpha = 0.5, lambdas = NULL) {
   
   # ---- Input validation ----
   T <- nrow(X)
@@ -108,12 +103,7 @@ fit_ridge_bic <- function(X, y, alpha = 0, lambdas = NULL) {
   if (length(y) != T) stop("X and y must have same number of rows")
   if (!is.matrix(X)) X <- as.matrix(X)
   
-  # ---- Standardize X (glmnet standardizes internally, but we do it for df calculation) ----
-  X_mean <- colMeans(X)
-  X_sd <- apply(X, 2, sd)
-  X_std <- scale(X, center = X_mean, scale = X_sd)
-  
-  # Fit glmnet (ridge: alpha=0, standardize=TRUE, intercept=TRUE)
+  # Fit glmnet (elastic net: alpha=0.5, standardize=TRUE, intercept=TRUE)
   fit <- glmnet(X, y, alpha = alpha, standardize = TRUE, intercept = TRUE, 
                 lambda = lambdas, thresh = 1e-7)
   
@@ -125,9 +115,9 @@ fit_ridge_bic <- function(X, y, alpha = 0, lambdas = NULL) {
   RSS_vec <- colSums((y - y_pred_matrix)^2)
   
   # ---- Compute degrees of freedom for each lambda ----
-  df_vec <- sapply(fit$lambda, function(lam) {
-    compute_ridge_df(X_std, lam)
-  })
+  # For Elastic Net: df = number of non-zero coefficients
+  coef_matrix <- coef(fit)[-1, ]  # exclude intercept
+  df_vec <- colSums(coef_matrix != 0)
   
   # ---- Compute BIC: log(RSS) + (log(T)/T) * df ----
   bic_penalty <- log(T) / T
@@ -150,29 +140,28 @@ fit_ridge_bic <- function(X, y, alpha = 0, lambdas = NULL) {
   return(list(
     lambda_best = lambda_best,
     bic_tbl = bic_tbl,
-    fit = fit,
-    X_mean = X_mean,
-    X_sd = X_sd
+    fit = fit
   ))
 }
 
 # Function 3: Helper to select lambda by BIC
-# Dispatches based on alpha (0=Ridge, 1=Lasso)
-select_lambda_bic <- function(X, y, alpha = 0, lambdas = NULL) {
+# Dispatches based on alpha (0=Ridge, 0.5=Elastic Net, 1=LASSO)
+select_lambda_bic <- function(X, y, alpha = 0.5, lambdas = NULL) {
   
   if (is.null(lambdas)) {
     # Generate default lambda sequence (glmnet default behavior)
     lambdas <- 10^seq(5, -2, length.out = 100)
   }
   
-  if (alpha == 0) {
-    # Ridge Regression
-    result <- fit_ridge_bic(X, y, alpha = 0, lambdas = lambdas)
+  if (alpha == 0.5) {
+    # Elastic Net Regression
+    result <- fit_enet_bic(X, y, alpha = 0.5, lambdas = lambdas)
+  } else if (alpha == 0) {
+    stop("Ridge not implemented in this file.")
   } else if (alpha == 1) {
-    # LASSO (not implemented yet, but structure ready)
-    stop("LASSO not yet implemented. Use alpha=0 for Ridge.")
+    stop("LASSO not implemented in this file.")
   } else {
-    stop("alpha must be 0 (Ridge) or 1 (LASSO)")
+    stop("alpha must be 0.5 (Elastic Net)")
   }
   
   return(result)
@@ -180,23 +169,23 @@ select_lambda_bic <- function(X, y, alpha = 0, lambdas = NULL) {
 
 ```
 
-## Example: Ridge Regression with BIC Lambda Selection
+## Example: Elastic Net Regression with BIC Lambda Selection
 
 ```{r}
-# ---- Fit Ridge Regression using BIC for lambda selection ----
+# ---- Fit Elastic Net Regression using BIC for lambda selection ----
 
-# Generate lambda sequence (smaller grid)
-lambdas <- 10^seq(5, -2, length.out = 100)
+# Generate lambda sequence (smaller range)
+lambdas <- 10^seq(5, -5, length.out = 100)
 
-# Fit ridge with BIC
-ridge_result <- select_lambda_bic(X_train, y_train, alpha = 0, lambdas = lambdas)
+# Fit elastic net with BIC
+enet_result <- select_lambda_bic(X_train, y_train, alpha = 0.5, lambdas = lambdas)
 
-cat("\n=== Ridge Regression: BIC-based Lambda Selection ===\n")
-cat("Optimal λ:", round(ridge_result$lambda_best, 6), "\n")
+cat("\n=== Elastic Net Regression: BIC-based Lambda Selection ===\n")
+cat("Optimal λ:", round(enet_result$lambda_best, 6), "\n")
 cat("Training size (T):", nrow(X_train), "\n")
 
 # Display top 10 lambdas by BIC
-top_bics <- ridge_result$bic_tbl %>%
+top_bics <- enet_result$bic_tbl %>%
   arrange(BIC) %>%
   head(10)
 
@@ -209,36 +198,36 @@ print(top_bics)
 # ---- Predict on test set ----
 
 # Extract the fitted model
-fit <- ridge_result$fit
-lambda_opt <- ridge_result$lambda_best
+fit <- enet_result$fit
+lambda_opt <- enet_result$lambda_best
 
 # Predict on test data
 y_pred_test <- predict(fit, newx = X_test, s = lambda_opt)
 
 # Compute test metrics
-mae_ridge <- mae(y_test, y_pred_test)
-rmse_ridge <- rmse(y_test, y_pred_test)
-r2_ridge <- cor(y_test, y_pred_test)^2
+mae_enet <- mae(y_test, y_pred_test)
+rmse_enet <- rmse(y_test, y_pred_test)
+r2_enet <- cor(y_test, y_pred_test)^2
 
-cat("\n=== Ridge Regression Test Performance ===\n")
-cat("MAE :", round(mae_ridge, 6), "\n")
-cat("RMSE:", round(rmse_ridge, 6), "\n")
-cat("R²  :", round(r2_ridge, 4), "\n")
+cat("\n=== Elastic Net Regression Test Performance ===\n")
+cat("MAE :", round(mae_enet, 6), "\n")
+cat("RMSE:", round(rmse_enet, 6), "\n")
+cat("R²  :", round(r2_enet, 4), "\n")
 
 ```
 
 ```{r}
 # ---- Visualize BIC curve ----
 
-ggplot(ridge_result$bic_tbl, aes(x = log10(lambda), y = BIC)) +
+ggplot(enet_result$bic_tbl, aes(x = log10(lambda), y = BIC)) +
   geom_line(color = "steelblue") +
-  geom_point(data = ridge_result$bic_tbl %>% filter(is_best), 
+  geom_point(data = enet_result$bic_tbl %>% filter(is_best), 
              color = "red", size = 3) +
   labs(
-    title = "Ridge Regression: BIC vs Log10(λ)",
+    title = "Elastic Net Regression: BIC vs Log10(λ)",
     x = "Log10(λ)",
     y = "BIC",
-    subtitle = paste("Optimal λ =", round(ridge_result$lambda_best, 6))
+    subtitle = paste("Optimal λ =", round(enet_result$lambda_best, 6))
   ) +
   theme_minimal() +
   theme(plot.subtitle = element_text(face = "italic"))
@@ -260,7 +249,7 @@ coefs_df <- data.frame(
 # Extract and display intercept
 intercept <- coefs_df %>% filter(feature == "(Intercept)") %>% pull(coefficient)
 
-cat("\n=== Ridge Regression Intercept (λ =", round(lambda_opt, 6), ") ===\n")
+cat("\n=== Elastic Net Regression Intercept (λ =", round(lambda_opt, 6), ") ===\n")
 cat("Intercept:", round(intercept, 8), "\n")
 
 # Remove intercept row for feature coefficients display
@@ -271,7 +260,8 @@ coefs_df <- coefs_df %>%
   mutate(abs_coef = abs(coefficient)) %>%
   arrange(desc(abs_coef))
 
-cat("\n=== Ridge Regression Coefficients (λ =", round(lambda_opt, 6), ") ===\n")
+cat("\n=== Elastic Net Regression Coefficients (λ =", round(lambda_opt, 6), ") ===\n")
+cat("Number of non-zero coefficients:", sum(coefs_df$coefficient != 0), "\n")
 print(coefs_df)
 
 ```
@@ -283,7 +273,7 @@ ggplot(coefs_df, aes(x = reorder(feature, coefficient), y = coefficient, fill = 
   geom_col() +
   scale_fill_manual(values = c("steelblue", "coral"), guide = "none") +
   labs(
-    title = "Ridge Regression Coefficients",
+    title = "Elastic Net Regression Coefficients",
     x = "Feature",
     y = "Coefficient Value"
   ) +
@@ -306,14 +296,14 @@ test_results <- data.frame(
 # Line plot: Forecasted vs Actual
 ggplot(test_results, aes(x = date)) +
   geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
-  geom_line(aes(y = forecasted, color = "Ridge Forecast"), linewidth = 0.8, linetype = "dashed") +
+  geom_line(aes(y = forecasted, color = "Elastic Net Forecast"), linewidth = 0.8, linetype = "dashed") +
   labs(
-    title = "Ridge Regression: Forecasted vs Actual Returns (Test Set)",
+    title = "Elastic Net Regression: Forecasted vs Actual Returns (Test Set)",
     x = "Date",
     y = "Log Return",
     color = "Series"
   ) +
-  scale_color_manual(values = c("Actual" = "steelblue", "Ridge Forecast" = "coral")) +
+  scale_color_manual(values = c("Actual" = "steelblue", "Elastic Net Forecast" = "coral")) +
   theme_minimal() +
   theme(legend.position = "bottom")
 
@@ -326,10 +316,10 @@ ggplot(test_results, aes(x = actual, y = forecasted)) +
   geom_point(alpha = 0.6, color = "steelblue", size = 2) +
   geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
   labs(
-    title = "Ridge Regression: Forecast Accuracy (Test Set)",
+    title = "Elastic Net Regression: Forecast Accuracy (Test Set)",
     x = "Actual Return",
     y = "Forecasted Return",
-    subtitle = paste("R² =", round(r2_ridge, 4), "| RMSE =", round(rmse_ridge, 6))
+    subtitle = paste("R² =", round(r2_enet, 4), "| RMSE =", round(rmse_enet, 6))
   ) +
   theme_minimal() +
   coord_fixed(ratio = 1)
@@ -337,36 +327,36 @@ ggplot(test_results, aes(x = actual, y = forecasted)) +
 ```
 
 ```{r}
-# ---- Save Ridge Regression Predictions and Results ----
+# ---- Save Elastic Net Regression Predictions and Results ----
 
 # Create results dataframe with predictions
-ridge_predictions <- test_results %>%
+enet_predictions <- test_results %>%
   select(date, actual, forecasted) %>%
   rename(
-    ridge_forecast = forecasted,
-    ridge_actual = actual
+    enet_forecast = forecasted,
+    enet_actual = actual
   )
 
 # Save predictions to CSV
-write.csv(ridge_predictions, "../data/ridge_predictions.csv", row.names = FALSE)
+write.csv(enet_predictions, "../data/enet_predictions.csv", row.names = FALSE)
 
 # Save model evaluation metrics
-ridge_metrics <- data.frame(
-  model = "Ridge Regression",
-  optimal_lambda = ridge_result$lambda_best,
-  MAE = mae_ridge,
-  RMSE = rmse_ridge,
-  R2 = r2_ridge
+enet_metrics <- data.frame(
+  model = "Elastic Net Regression",
+  optimal_lambda = enet_result$lambda_best,
+  MAE = mae_enet,
+  RMSE = rmse_enet,
+  R2 = r2_enet
 )
 
-# write.csv(ridge_metrics, "../data/ridge_metrics.csv", row.names = FALSE)
+write.csv(enet_metrics, "../data/enet_metrics.csv", row.names = FALSE)
 
 # Save BIC table
-# write.csv(ridge_result$bic_tbl, "../data/ridge_bic_table.csv", row.names = FALSE)
+write.csv(enet_result$bic_tbl, "../data/enet_bic_table.csv", row.names = FALSE)
 
-cat("\n=== Ridge Regression Results Saved ===\n")
-cat("✓ Predictions saved to: ../data/ridge_predictions.csv\n")
-cat("✓ Metrics saved to: ../data/ridge_metrics.csv\n")
-cat("✓ BIC table saved to: ../data/ridge_bic_table.csv\n")
+cat("\n=== Elastic Net Regression Results Saved ===\n")
+cat("✓ Predictions saved to: ../data/enet_predictions.csv\n")
+cat("✓ Metrics saved to: ../data/enet_metrics.csv\n")
+cat("✓ BIC table saved to: ../data/enet_bic_table.csv\n")
 
 ```
