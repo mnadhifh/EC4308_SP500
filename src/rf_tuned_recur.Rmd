@@ -31,9 +31,9 @@ data <- data %>%
   select(
     date,
     log_ret,
-    matches("_L[1-4]$")       # only lagged features
+    matches("^price_fd_L[1-5]$"),
+    matches("_L[2-5]$")       # only lagged features from at least 2 periods ago
   ) %>%
-  select(-matches("price")) %>% 
   left_join(
     data_mean %>% select(date, mean_prevailing_ret),
     by = "date"
@@ -76,7 +76,7 @@ test_data  <- rf_df[(train_size + 1):n, ]
 rf_param_grid <- expand.grid(
   mtry = c(5, 10, 20, 30, 40, 50),    # important: feature sampling 
   nodesize = c(1, 2, 3, 5),           # regularisation/tree complexity
-  ntree = 200                         # fixed: given train size 165, we can afford 200 trees
+  ntree = c(50, 100, 200)                         # given train size 165, we can afford 200 trees
 )
 
 train_tune_size <- floor(0.8 * train_size)
@@ -119,32 +119,22 @@ cat("Validation RMSE:", round(best_val_rmse, 5), "\n")
 
 cat("\n=== Starting Recursive Forecast Evaluation ===\n")
 
-rf_recursive_preds <- rep(NA_real_, test_size)
+rf_model_final <- randomForest(
+  x = train_data %>% select(-date, -log_ret),
+  y = train_data$log_ret,
+  ntree = best_params_rf$ntree,
+  mtry = best_params_rf$mtry,
+  nodesize = best_params_rf$nodesize
+)
 
-for (t in 1:test_size) {
-  
-  train_subset <- rf_df[1:(train_size + t - 1), ]
-  test_point   <- rf_df[train_size + t, , drop = FALSE]
-  
-  X_train <- train_subset %>% select(-date, -log_ret)
-  y_train <- train_subset$log_ret
-  X_test  <- test_point  %>% select(-date, -log_ret)
-  
-  rf_model_final <- randomForest(
-    x = X_train, y = y_train,
-    ntree = best_params_rf$ntree,
-    mtry = best_params_rf$mtry,
-    nodesize = best_params_rf$nodesize
-  )
-  
-  rf_recursive_preds[t] <- predict(rf_model_final, newdata = X_test)
+rf_forecasts <- predict(rf_model_final, 
+                        newdata = test_data %>% select(-date, -log_ret))
 
-}
 
 cat("Prediction complete!\n")
 
 # Store forecasts in df
-rf_df$rf_forecast_ret <- c(rep(NA, train_size), rf_recursive_preds)
+rf_df$rf_forecast_ret <- c(rep(NA, train_size), rf_forecasts)
 
 
 ```
@@ -195,7 +185,7 @@ cat("\n=== TEST SET PERFORMANCE (Q207-Q258, n =", nrow(rf_eval_df), "quarters) =
 
 # MAE, RMSE, R²
 actual <- tail(rf_df$log_ret, test_size)
-pred   <- rf_recursive_preds
+pred   <- rf_forecasts
 
 MAE_rf  <- mean(abs(actual - pred))
 RMSE_rf <- sqrt(mean((actual - pred)^2))
@@ -207,11 +197,10 @@ cat("MAE :", round(MAE_rf, 6),
     "\nRMSE:", round(RMSE_rf, 6),
     "\nR²  :", round(R2_rf, 4))
 
-#DM Test
 dm_test_rf <- dm.test(
   e1 = rf_eval_df$err_rf,
   e2 = rf_eval_df$err_mean,
-  alternative = "less"   # H1: RF has lower expected error
+  alternative = "less"
 )
 
 cat("\n\n=== DM Test: Random Forest VS Prevailing Mean ===\n")
@@ -227,6 +216,75 @@ if(dm_test_rf$p.value < 0.05) {
   cat("\nConclusion: The p-value >= 0.05 → We fail to reject the null hypothesis.\n")
   cat("Random Forest does not significantly outperform the Prevailing Mean Model.\n")
 }
+```
+
+``` {r}
+
+library(sandwich)  # Newey–West
+library(lmtest)
+
+# Directional 0-1 loss: 1 if signs disagree, else 0
+dir_loss <- function(actual, pred, zero_rule = "tie_ok") {
+  # zero_rule: how to treat zeros in actual or pred
+  #  - "tie_ok": a zero counts as "no sign" and matches only if both are zero
+  #  - "nonpos": treat 0 as non-positive (<=0)
+  if (zero_rule == "tie_ok") {
+    a <- ifelse(actual > 0,  1, ifelse(actual < 0, -1, 0))
+    p <- ifelse(pred   > 0,  1, ifelse(pred   < 0, -1, 0))
+  } else {
+    a <- ifelse(actual > 0, 1, -1)  # 0 -> -1
+    p <- ifelse(pred   > 0, 1, -1)
+  }
+  as.numeric(a != p)
+}
+
+# Robust DM test for *any* scalar loss (e.g., 0-1 directional loss)
+# loss1, loss2 must be aligned vectors (same timestamps)
+dm_test_hac_loss <- function(loss1, loss2, h = 1, lag = NULL, two_sided = TRUE) {
+  stopifnot(length(loss1) == length(loss2))
+  d <- loss1 - loss2
+  d <- d[is.finite(d)]
+  if (length(d) < 5) stop("Not enough observations for DM test.")
+
+  # Regress on intercept and use HAC variance for long-run variance of d
+  fit <- lm(d ~ 1)
+  # Choose HAC lag: if not supplied, use max(h-1, floor(T^(1/4)))
+  Tn <- length(d)
+  if (is.null(lag)) lag <- max(h - 1, floor(Tn^(1/4)))
+  S <- NeweyWest(fit, lag = lag, prewhite = FALSE, adjust = TRUE)
+
+  dbar <- coef(fit)[1]
+  se   <- sqrt(S[1, 1] / Tn)
+  stat <- as.numeric(dbar / se)
+
+  if (two_sided) {
+    pval <- 2 * (1 - pnorm(abs(stat)))
+  } else {
+    # one-sided H1: model 1 has *lower* loss than model 2  (mean(d) < 0)
+    pval <- pnorm(stat)  # P(Z <= stat)
+  }
+  list(statistic = stat, p.value = pval, mean_diff = dbar, n = Tn, lag_used = lag)
+}
+
+
+# Example construction if you have a comparison_df already
+# with columns: date, log_ret, rf_forecast_ret, xgb_forecast_ret, mean_prevailing_ret
+y_test   <- rf_eval_df$log_ret
+rf_pred  <- rf_eval_df$rf_forecast_ret
+mean_pred<- rf_eval_df$mean_prevailing_ret
+
+# Directional 0-1 losses
+rf_loss   <- dir_loss(y_test, rf_pred,  zero_rule = "nonpos")
+mean_loss <- dir_loss(y_test, mean_pred,zero_rule = "nonpos")
+
+# --- Robust DM (recommended for recursive estimation, or just to be safe) ---
+# H1: first model has *lower* loss than the second (one-sided)
+dm_rf_vs_mean  <- dm_test_hac_loss(rf_loss,  mean_loss, h = 1, two_sided = FALSE)
+
+cat("\nDM (RF < Mean):     stat =", round(dm_rf_vs_mean$statistic, 3),
+    "p =", signif(dm_rf_vs_mean$p.value, 4), "\n")
+
+
 ```
 
 ##Feature Importance Plot

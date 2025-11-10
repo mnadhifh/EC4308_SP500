@@ -14,7 +14,7 @@ library(lubridate)
 library(ggplot2)
 library(Metrics)
 library(forecast)
-library(randomForest)
+library(xgboost)
 library(pdp)
 ```
 
@@ -30,9 +30,9 @@ data <- data %>%
   select(
     date,
     log_ret,
-    matches("_L[1-4]$")       # only lagged features
+    matches("^price_fd_L[1-5]$"),
+    matches("_L[2-5]$")       # only lagged features from at least 2 periods ago
   ) %>%
-  select(-matches("price")) %>% 
   left_join(
     data_mean %>% select(date, mean_prevailing_ret),
     by = "date"
@@ -128,43 +128,35 @@ cat("Best Val RMSE:", round(best_val_rmse_xgb, 6), "\n\n")
 
 cat("=== Starting Recursive XGBoost Forecasting ===\n")
 
-xgb_recursive_preds <- rep(NA_real_, test_size)
+X_train_full <- train_data %>% select(-date, -log_ret)
+y_train_full <- train_data$log_ret
 
-for (t in 1:test_size) {
-  # expanding window up to current test quarter
-  train_subset <- xgb_df[1:(train_size + t - 1), ]
-  test_point   <- xgb_df[train_size + t, , drop = FALSE]
-  
-  X_train <- train_subset %>% select(-date, -log_ret)
-  y_train <- train_subset$log_ret
-  X_test  <- test_point  %>% select(-date, -log_ret)
-  
-  dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
-  dtest  <- xgb.DMatrix(data = as.matrix(X_test))
-  
-  params_final <- list(
-    objective        = "reg:squarederror",
-    max_depth        = best_params_xgb$max_depth,
-    eta              = best_params_xgb$eta,
-    subsample        = best_params_xgb$subsample,
-    colsample_bytree = best_params_xgb$colsample_bytree
-  )
-  
-  xgb_model_final <- xgb.train(
-    params  = params_final,
-    data    = dtrain,
-    nrounds = best_nrounds,
-    verbose = 0
-  )
-  
-  xgb_recursive_preds[t] <- predict(xgb_model_final, dtest)
-  
-}
+dtrain_full <- xgb.DMatrix(as.matrix(X_train_full), label = y_train_full)
+
+params_final <- list(
+  objective        = "reg:squarederror",
+  max_depth        = best_params_xgb$max_depth,
+  eta              = best_params_xgb$eta,
+  subsample        = best_params_xgb$subsample,
+  colsample_bytree = best_params_xgb$colsample_bytree
+)
+
+xgb_model_final <- xgb.train(
+  params  = params_final,
+  data    = dtrain_full,
+  nrounds = best_nrounds,
+  verbose = 0
+)
 
 
 cat("Prediction complete!\n")
 
-xgb_df$xgb_forecast_ret <- c(rep(NA, train_size), xgb_recursive_preds)
+X_test_full <- test_data %>% select(-date, -log_ret)
+dtest_full  <- xgb.DMatrix(as.matrix(X_test_full))
+
+xgb_forecasts <- predict(xgb_model_final, dtest_full)
+
+xgb_df$xgb_forecast_ret <- c(rep(NA, train_size), xgb_forecasts)
 
 ```
 
@@ -212,7 +204,7 @@ cat("\n=== TEST SET PERFORMANCE (Q207-Q258, n =", nrow(xgb_eval_df), "quarters) 
 
 # MAE, RMSE, R²
 actual <- tail(xgb_df$log_ret, test_size)
-pred   <- xgb_recursive_preds
+pred   <- xgb_forecasts
 
 MAE_xgb  <- mean(abs(actual - pred))
 RMSE_xgb <- sqrt(mean((actual - pred)^2))
@@ -246,6 +238,74 @@ if(dm_test_xgb$p.value < 0.05) {
 }
 ```
 
+
+``` {r}
+library(sandwich)  # Newey–West
+library(lmtest)
+
+# Directional 0-1 loss: 1 if signs disagree, else 0
+dir_loss <- function(actual, pred, zero_rule = "tie_ok") {
+  # zero_rule: how to treat zeros in actual or pred
+  #  - "tie_ok": a zero counts as "no sign" and matches only if both are zero
+  #  - "nonpos": treat 0 as non-positive (<=0)
+  if (zero_rule == "tie_ok") {
+    a <- ifelse(actual > 0,  1, ifelse(actual < 0, -1, 0))
+    p <- ifelse(pred   > 0,  1, ifelse(pred   < 0, -1, 0))
+  } else {
+    a <- ifelse(actual > 0, 1, -1)  # 0 -> -1
+    p <- ifelse(pred   > 0, 1, -1)
+  }
+  as.numeric(a != p)
+}
+
+# Robust DM test for *any* scalar loss (e.g., 0-1 directional loss)
+# loss1, loss2 must be aligned vectors (same timestamps)
+dm_test_hac_loss <- function(loss1, loss2, h = 1, lag = NULL, two_sided = TRUE) {
+  stopifnot(length(loss1) == length(loss2))
+  d <- loss1 - loss2
+  d <- d[is.finite(d)]
+  if (length(d) < 5) stop("Not enough observations for DM test.")
+
+  # Regress on intercept and use HAC variance for long-run variance of d
+  fit <- lm(d ~ 1)
+  # Choose HAC lag: if not supplied, use max(h-1, floor(T^(1/4)))
+  Tn <- length(d)
+  if (is.null(lag)) lag <- max(h - 1, floor(Tn^(1/4)))
+  S <- NeweyWest(fit, lag = lag, prewhite = FALSE, adjust = TRUE)
+
+  dbar <- coef(fit)[1]
+  se   <- sqrt(S[1, 1] / Tn)
+  stat <- as.numeric(dbar / se)
+
+  if (two_sided) {
+    pval <- 2 * (1 - pnorm(abs(stat)))
+  } else {
+    # one-sided H1: model 1 has *lower* loss than model 2  (mean(d) < 0)
+    pval <- pnorm(stat)  # P(Z <= stat)
+  }
+  list(statistic = stat, p.value = pval, mean_diff = dbar, n = Tn, lag_used = lag)
+}
+
+# Example construction if you have a comparison_df already
+# with columns: date, log_ret, rf_forecast_ret, xgb_forecast_ret, mean_prevailing_ret
+y_test   <- xgb_eval_df$log_ret
+xgb_pred <- xgb_eval_df$xgb_forecast_ret
+mean_pred<- xgb_eval_df$mean_prevailing_ret
+
+# Directional 0-1 losses
+xgb_loss  <- dir_loss(y_test, xgb_pred, zero_rule = "nonpos")
+mean_loss <- dir_loss(y_test, mean_pred,zero_rule = "nonpos")
+
+# --- Robust DM (recommended for recursive estimation, or just to be safe) ---
+# H1: first model has *lower* loss than the second (one-sided)
+dm_xgb_vs_mean <- dm_test_hac_loss(xgb_loss, mean_loss, h = 1, two_sided = FALSE)
+
+cat("DM (XGB < Mean):    stat =", round(dm_xgb_vs_mean$statistic, 3),
+    "p =", signif(dm_xgb_vs_mean$p.value, 4), "\n")
+
+
+```
+
 ##Feature Importance
 ```{r}
 # Feature importance (Top 10 by Gain)
@@ -268,7 +328,7 @@ ggplot(imp_top10, aes(x = Feature, y = Gain)) +
 
 ``` {r}
 # save model for later use 
-#write_csv(xgb_df, "../data/xgb_results.csv")
-#write_csv(xgb_eval_df, "../data/xgb_evals.csv")
+write_csv(xgb_df, "../data/xgb_results.csv")
+write_csv(xgb_eval_df, "../data/xgb_evals.csv")
 
 ```

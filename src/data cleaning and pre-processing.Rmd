@@ -16,6 +16,8 @@ library(ggplot2)
 library(dplyr)
 library(purrr)
 library(zoo)
+library(tseries)
+library(fracdiff)
 ```
 
 
@@ -112,8 +114,8 @@ sum(duplicated(data_merged)) #check for duplicates
 ## Fractional Differencing 
 Fractional differencing done to features which are non-stationary (first checked using ADF test with threshold 0.05). Fractional differencing may provide greater benefit to the model by keeping the signal while making the feature stationary.
 ``` {r}
-library(tseries)
-library(fracdiff)
+
+nonstationary_vars <- c()
 
 # Columns to test (excluding date)
 vars <- setdiff(names(data_merged), "date")
@@ -124,15 +126,17 @@ for (v in vars) {
     test <- suppressWarnings(adf.test(na.omit(x)))
     
     if (test$p.value > 0.05) {
-      #cat("ADF test p-value:", test$p.value, "\n")
-
       fd <- fracdiff(na.omit(x), nar = 0, nma = 0)
       data_merged[[paste0(v, "_fd")]] <- diffseries(na.omit(x), d = fd$d)
+      nonstationary_vars <- c(nonstationary_vars, v)
       cat(v, ": ADF p-value:", test$p.value, 
           ", fractional differencing (d =", round(fd$d, 3), ")\n")
     }
   }
 }
+
+# remove the original non-stationary variables
+data_merged <- data_merged %>% select(-any_of(nonstationary_vars))
 
 ```
 
@@ -140,17 +144,17 @@ for (v in vars) {
 ## Adding Lags
 ``` {r}
 
-predictors <- setdiff(names(data_merged), c("date", "price", "log_ret"))
+predictors <- setdiff(names(data_merged), c("date", "log_ret"))
 
-# we choose to add 4 lags 
+# we choose to add 5 lags 
 for (v in predictors) {
-  for (lag_n in 1:4) {
+  for (lag_n in 1:5) {
     data_merged[[paste0(v, "_L", lag_n)]] <- dplyr::lag(data_merged[[v]], lag_n)
   }
 }
 
 # remove NAs introduced by adding lags
-data_merged <- data_merged %>% filter(row_number() > 4)
+data_merged <- data_merged %>% filter(row_number() > 5)
 
 sum(is.na(data_merged))
 #colSums(is.na(data_merged))

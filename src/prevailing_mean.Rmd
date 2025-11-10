@@ -19,14 +19,13 @@ library(forecast)
 ## Loading Datasets
 ```{r}
 
-data = read.csv("../data/data_merged.csv") %>%
+data = read.csv("../data/data_merged.csv")  %>%
   select(
     date,
     log_ret,
-    matches("_L[1-4]$")       # only lagged features
-  ) %>%
-  select(-matches("price")) %>% 
-  drop_na()
+    matches("^price_fd_L[1-5]$"),
+    matches("_L[2-5]$")       # only lagged features from at least 2 periods ago
+  ) 
 
 ```
 
@@ -109,8 +108,7 @@ if(dm_test_mean$p.value < 0.05) {
 
 ``` {r}
 # saving results from model for use later
-#write_csv(plot_df,  "../data/prevail_mean.csv")
-
+write_csv(plot_df,  "../data/prevail_mean.csv")
 ```
 
 Can see that the prevailing mean model does outperform the random walk AR(1) model. 
