@@ -1,0 +1,116 @@
+---
+title: "Prevailing Mean Model (benchmark)"
+author: "marth"
+date: "2025-11-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+# SETTING UP LIBRARIES
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(Metrics)
+library(forecast)
+```
+
+## Loading Datasets
+```{r}
+
+data = read.csv("../data/data_merged.csv") %>%
+  select(
+    date,
+    log_ret,
+    matches("_L[1-4]$")       # only lagged features
+  ) %>%
+  select(-matches("price")) %>% 
+  drop_na()
+
+```
+
+## Benchmark Model - Prevailing Mean 
+Our first benchmark will be a prevailing mean of S&P500 returns
+```{r}
+data$date <- as.Date(data$date)
+
+window_size <- 60
+
+data <- data %>%
+  mutate(
+    mean_prevailing_ret = map_dbl(seq_along(log_ret), function(i) {
+      if (i <= window_size) return(NA_real_)
+      mean(log_ret[(i - window_size):(i - 1)], na.rm = TRUE)
+    })
+  )
+
+# Remove first rows that have NA forecast
+plot_df <- data %>% filter(!is.na(mean_prevailing_ret))
+
+# Plot
+ggplot(plot_df, aes(x = date)) +
+  geom_line(aes(y = log_ret, color = "Actual S&P 500 return")) +
+  geom_line(aes(y = mean_prevailing_ret, color = "Prevailing mean return forecast")) +
+  labs(
+    title = "S&P 500 Return Forecast: Prevailing Mean Benchmark",
+    x = "Date",
+    y = "Log Return",
+    color = ""
+  ) +
+  theme_minimal()
+```
+
+##Prevailing Mean Metrics
+```{r}
+PM_df <- data %>%
+  mutate(lag_ret = dplyr::lag(log_ret)
+  ) %>%
+  filter(!is.na(log_ret), !is.na(mean_prevailing_ret), !is.na(lag_ret)) %>%
+  mutate(
+    err_mean = log_ret - mean_prevailing_ret,  # prevailing-mean forecast errors
+    err_rw   = log_ret - lag_ret               # random-walk benchmark errors
+  )
+
+# Metrics
+MAE_mean  <- mae(PM_df$log_ret, PM_df$mean_prevailing_ret)
+RMSE_mean <- rmse(PM_df$log_ret, PM_df$mean_prevailing_ret)
+R2_mean   <- cor(PM_df$log_ret, PM_df$mean_prevailing_ret)^2
+
+cat("\n=== Prevailing Mean Return Forecast ===\n")
+cat("MAE :", round(MAE_mean, 6),
+    "\nRMSE:", round(RMSE_mean, 6),
+    "\nR²  :", round(R2_mean, 4), "\n")
+
+# Diebold–Mariano Test (Prevailing Mean vs Random Walk)
+dm_test_mean <- dm.test(
+  e1 = PM_df$err_mean,
+  e2 = PM_df$err_rw,
+  alternative = "less",  # H1: prevailing mean has lower expected loss
+  h = 1, power = 2
+)
+
+cat("\n=== DM Test: Prevailing Mean vs Lag-Return (Random Walk) ===\n")
+cat("DM Statistic:", round(as.numeric(dm_test_mean$statistic), 3),
+    "\nP-value:", signif(dm_test_mean$p.value, 4), "\n")
+
+# === Conclusion Interpretation ===
+if(dm_test_mean$p.value < 0.05) {
+  cat("\nConclusion: The p-value < 0.05 → We reject the null hypothesis.\n")
+  cat("The prevailing mean forecast has significantly lower forecast error\n")
+  cat("than the random-walk (last return) benchmark.\n")
+} else {
+  cat("\nConclusion: The p-value >= 0.05 → We fail to reject the null hypothesis.\n")
+  cat("The prevailing mean forecast does not significantly outperform\n")
+  cat("the random-walk (last return) benchmark.\n")
+}
+
+```
+
+``` {r}
+# saving results from model for use later
+#write_csv(plot_df,  "../data/prevail_mean.csv")
+
+```
+
+Can see that the prevailing mean model does outperform the random walk AR(1) model. 

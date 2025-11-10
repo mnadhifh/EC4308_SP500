@@ -1,0 +1,297 @@
+---
+title: "RF Tuned Recursive CV"
+author: "marth"
+output: html_document
+date: "2025-11-10"
+---
+
+```{r setup, include=FALSE}
+
+# SETTING UP LIBRARIES
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(Metrics)
+library(forecast)
+library(randomForest)
+library(pdp)
+```
+
+## Loading Datasets
+```{r}
+
+data = read.csv("../data/data_merged.csv")
+data_mean = read.csv("../data/prevail_mean.csv")
+
+data$date <- as.Date(data$date)
+data_mean$date <- as.Date(data_mean$date)
+
+data <- data %>%
+  select(
+    date,
+    log_ret,
+    matches("_L[1-4]$")       # only lagged features
+  ) %>%
+  select(-matches("price")) %>% 
+  left_join(
+    data_mean %>% select(date, mean_prevailing_ret),
+    by = "date"
+  )
+
+```
+
+
+## Random Forest with Hyperparameter Tuning
+
+# ============================================================================
+# MODELING APPROACH: 80/20 Train-Test Split w/ Recursive CV
+# ============================================================================
+
+
+```{r}
+# --- STEP 1: Prepare data ---
+
+rf_df <- data %>%
+  arrange(date) %>%
+  select(-mean_prevailing_ret) %>%
+  drop_na()
+
+set.seed(123)
+
+n <- nrow(rf_df)
+train_size <- floor(0.8 * n)  # 204 quarters (training)
+test_size <- n - train_size   # 52 quarters (testing)
+
+cat("\n=== Data Split ===\n")
+cat("Training:", train_size, "quarters\n")
+cat("Testing :", test_size, "quarters\n")
+
+train_data <- rf_df[1:train_size, ]
+test_data  <- rf_df[(train_size + 1):n, ]
+
+# --- STEP 2: Hyperparameter tuning  ---
+# will conduct hyperparameter tuning to get a set of best params, then recursive CV using these
+
+rf_param_grid <- expand.grid(
+  mtry = c(5, 10, 20, 30, 40, 50),    # important: feature sampling 
+  nodesize = c(1, 2, 3, 5),           # regularisation/tree complexity
+  ntree = 200                         # fixed: given train size 165, we can afford 200 trees
+)
+
+train_tune_size <- floor(0.8 * train_size)
+val_tune_size   <- train_size - train_tune_size
+
+X_train_tune <- train_data[1:train_tune_size, ] %>% select(-date, -log_ret)
+y_train_tune <- train_data$log_ret[1:train_tune_size]
+
+X_val_tune <- train_data[(train_tune_size + 1):train_size, ] %>% select(-date, -log_ret)
+y_val_tune <- train_data$log_ret[(train_tune_size + 1):train_size]
+
+best_val_rmse <- Inf
+best_params_rf <- NULL
+
+
+for (i in 1:nrow(rf_param_grid)) {
+  temp_rf <- randomForest(
+    x = X_train_tune, y = y_train_tune,
+    ntree = rf_param_grid$ntree[i],
+    mtry = rf_param_grid$mtry[i],
+    nodesize = rf_param_grid$nodesize[i]
+  )
+  
+  val_preds <- predict(temp_rf, newdata = X_val_tune)
+  val_rmse <- sqrt(mean((y_val_tune - val_preds)^2))
+  
+  if (val_rmse < best_val_rmse) {
+    best_val_rmse <- val_rmse
+    best_params_rf <- rf_param_grid[i, ]
+  }
+}
+
+cat("\n=== Best RF Params ===\n")
+cat("mtry     :", best_params_rf$mtry, "\n")
+cat("nodesize :", best_params_rf$nodesize, "\n")
+cat("Validation RMSE:", round(best_val_rmse, 5), "\n")
+
+# --- STEP 3: Recursive CV ---
+# will use an expanding window, loop over 
+
+cat("\n=== Starting Recursive Forecast Evaluation ===\n")
+
+rf_recursive_preds <- rep(NA_real_, test_size)
+
+for (t in 1:test_size) {
+  
+  train_subset <- rf_df[1:(train_size + t - 1), ]
+  test_point   <- rf_df[train_size + t, , drop = FALSE]
+  
+  X_train <- train_subset %>% select(-date, -log_ret)
+  y_train <- train_subset$log_ret
+  X_test  <- test_point  %>% select(-date, -log_ret)
+  
+  rf_model_final <- randomForest(
+    x = X_train, y = y_train,
+    ntree = best_params_rf$ntree,
+    mtry = best_params_rf$mtry,
+    nodesize = best_params_rf$nodesize
+  )
+  
+  rf_recursive_preds[t] <- predict(rf_model_final, newdata = X_test)
+
+}
+
+cat("Prediction complete!\n")
+
+# Store forecasts in df
+rf_df$rf_forecast_ret <- c(rep(NA, train_size), rf_recursive_preds)
+
+
+```
+
+
+```{r}
+# Join RF forecasts to actual returns and prevailing mean benchmark
+plot_rf_df <- rf_df %>%
+  left_join(
+    data %>% select(date, mean_prevailing_ret),
+    by = "date"
+  ) %>%
+  drop_na()
+
+# ONLY PLOT TEST SET (last 52 quarters)
+
+ggplot(plot_rf_df %>% tail(test_size), aes(x = date)) +
+  geom_line(aes(y = log_ret,             color = "Actual returns")) +
+  geom_line(aes(y = mean_prevailing_ret, color = "Prevailing-mean forecast")) +
+  geom_line(aes(y = rf_forecast_ret,     color = "Random Forest forecast")) +
+  labs(
+    title = "S&P 500 Log Return Forecasts: RF vs Prevailing Mean vs Actual (TEST SET)",
+    subtitle = paste("Test period:", test_size, "quarters (Q207-Q258)"),
+    x = "Year",
+    y = "Log Return",
+    color = ""
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r}
+# EVALUATE ONLY ON TEST SET
+rf_eval_df <- plot_rf_df %>%
+  tail(test_size) %>%   # last 52 quarters = test set
+  filter(
+    !is.na(log_ret),
+    !is.na(rf_forecast_ret),
+    !is.na(mean_prevailing_ret)
+  ) %>%
+  mutate(
+    err_rf   = log_ret - rf_forecast_ret,
+    err_mean = log_ret - mean_prevailing_ret
+  )
+
+cat("\n=== TEST SET PERFORMANCE (Q207-Q258, n =", nrow(rf_eval_df), "quarters) ===\n\n")
+
+# MAE, RMSE, R²
+actual <- tail(rf_df$log_ret, test_size)
+pred   <- rf_recursive_preds
+
+MAE_rf  <- mean(abs(actual - pred))
+RMSE_rf <- sqrt(mean((actual - pred)^2))
+R2_rf   <- cor(actual, pred, use = "complete.obs")^2
+
+
+cat("=== Random Forest Forecast Performance ===\n")
+cat("MAE :", round(MAE_rf, 6),
+    "\nRMSE:", round(RMSE_rf, 6),
+    "\nR²  :", round(R2_rf, 4))
+
+#DM Test
+dm_test_rf <- dm.test(
+  e1 = rf_eval_df$err_rf,
+  e2 = rf_eval_df$err_mean,
+  alternative = "less"   # H1: RF has lower expected error
+)
+
+cat("\n\n=== DM Test: Random Forest VS Prevailing Mean ===\n")
+cat("DM Statistic:", round(as.numeric(dm_test_rf$statistic), 3),
+    "\nP-value:", signif(dm_test_rf$p.value, 4), "\n")
+
+# === Conclusion Interpretation ===
+if(dm_test_rf$p.value < 0.05) {
+  cat("\nConclusion: The p-value < 0.05 → We reject the null hypothesis.\n")
+  cat("Random Forest has significantly lower forecast error\n")
+  cat("than the Prevailing Mean model.\n")
+} else {
+  cat("\nConclusion: The p-value >= 0.05 → We fail to reject the null hypothesis.\n")
+  cat("Random Forest does not significantly outperform the Prevailing Mean Model.\n")
+}
+```
+
+##Feature Importance Plot
+```{r}
+# Extract importance values from final RF model 
+imp <- importance(rf_model_final)
+
+# Convert to clean dataframe
+imp_df <- data.frame(
+  Feature = rownames(imp),
+  Importance = imp[, 1]   # %IncMSE for regression
+)
+
+# Select Top 10 features to display in the plot
+imp_top10 <- imp_df %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = 10)
+
+ggplot(imp_top10, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Feature Importance (%IncMSE)",
+    x = "Predictor (Lagged Features)",
+    y = "Importance"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(face = "bold")
+  )
+
+```
+##PDP Plot
+```{r}
+top3 <- imp_top10$Feature[1:3]
+
+for (feat in top3) {
+  pd <- partial(
+    rf_model_final,
+    pred.var = feat,
+    train = train_data %>% select(-date, -log_ret),
+    grid.resolution = 40
+  )
+  
+  p <- autoplot(pd) +
+    labs(
+      title = paste("Partial Dependence Plot:", feat),
+      x = feat,
+      y = "Effect on Predicted Return"
+    ) +
+    theme_minimal()
+  
+  print(p)
+}
+
+```
+##OOB Error
+```{r}
+plot(rf_model_final, main = "OOB Error vs Number of Trees (Random Forest)")
+```
+##From the plot, we see that Eeror drops quickly in the first ~50 trees, and the curve flattens and stabilizes around 100 trees. Afteraround 100 trees, the OOB error does not meaningfully decrease anymor (the model is basically just averaging noise (flat tail)). So, adding more trees beyond ~150 does not improve accuracy. Hence, we conclude that we could have choosen about 150 trees for a stable and low variance random forest model.
+
+``` {r}
+# save model for later use 
+#write_csv(rf_df, "../data/rf_results.csv")
+#write_csv(rf_eval_df, "../data/rf_evals.csv")
+```
