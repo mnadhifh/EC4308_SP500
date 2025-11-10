@@ -1,0 +1,372 @@
+---
+title: "Ridge Regression"
+author: "marth"
+output: html_document
+date: "2025-11-10"
+---
+
+```{r setup, include=FALSE}
+
+# SETTING UP LIBRARIES
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(Metrics)
+library(forecast)
+library(glmnet)
+```
+
+## Loading Datasets
+```{r}
+
+data = read.csv("../data/data_merged.csv")
+data_mean = read.csv("../data/prevail_mean.csv")
+
+data$date <- as.Date(data$date)
+data_mean$date <- as.Date(data_mean$date)
+
+data <- data %>%
+  select(
+    date,
+    log_ret,
+    matches("_L[1-4]$")       # only lagged features
+  ) %>%
+  select(-matches("price")) %>% 
+  left_join(
+    data_mean %>% select(date, mean_prevailing_ret),
+    by = "date"
+  )
+
+```
+
+## Ridge Regression Model
+
+# ============================================================================
+# MODELING APPROACH: 80/20 Train-Test Split w/ Recursive CV
+# ============================================================================
+
+```{r}
+# --- STEP 1: Prepare data ---
+
+ridge_df <- data %>%
+  arrange(date) %>%
+  select(-mean_prevailing_ret) %>%
+  drop_na()
+
+set.seed(123)
+
+n <- nrow(ridge_df)
+train_size <- floor(0.8 * n)  # 80% training
+test_size <- n - train_size   # 20% testing
+
+cat("\n=== Data Split ===\n")
+cat("Training:", train_size, "observations\n")
+cat("Testing :", test_size, "observations\n")
+
+train_data <- ridge_df[1:train_size, ]
+test_data  <- ridge_df[(train_size + 1):n, ]
+
+# Extract features and target
+X_train <- train_data %>% select(-date, -log_ret) %>% as.matrix()
+y_train <- train_data$log_ret
+
+X_test <- test_data %>% select(-date, -log_ret) %>% as.matrix()
+y_test <- test_data$log_ret
+
+cat("\nFeatures in model:", ncol(X_train), "\n")
+
+```
+
+## Helper Functions: BIC-based Lambda Selection
+
+```{r}
+# ============================================================================
+# BIC-based Lambda Selection Functions (Kock & Callot)
+# BIC(λ) = log(RSS(λ)) + (log(T)/T)·df(λ)
+# ============================================================================
+
+# Function 1: Compute degrees of freedom for Ridge Regression
+# df(λ) = Σ_i d_i^2/(d_i^2+λ) where d_i are singular values of standardized X
+compute_ridge_df <- function(X_standardized, lambda) {
+  # Singular value decomposition
+  svd_result <- svd(X_standardized)
+  d <- svd_result$d  # singular values
+  
+  # df(λ) = sum(d_i^2 / (d_i^2 + λ))
+  df <- sum((d^2) / (d^2 + lambda))
+  
+  return(df)
+}
+
+# Function 2: Fit Ridge Regression and compute BIC for each lambda
+fit_ridge_bic <- function(X, y, alpha = 0, lambdas = NULL) {
+  
+  # ---- Input validation ----
+  T <- nrow(X)
+  
+  if (length(y) != T) stop("X and y must have same number of rows")
+  if (!is.matrix(X)) X <- as.matrix(X)
+  
+  # ---- Standardize X (glmnet standardizes internally, but we do it for df calculation) ----
+  X_mean <- colMeans(X)
+  X_sd <- apply(X, 2, sd)
+  X_std <- scale(X, center = X_mean, scale = X_sd)
+  
+  # Fit glmnet (ridge: alpha=0, standardize=TRUE, intercept=TRUE)
+  fit <- glmnet(X, y, alpha = alpha, standardize = TRUE, intercept = TRUE, 
+                lambda = lambdas, thresh = 1e-7)
+  
+  # ---- Compute RSS on training data ----
+  # Get predictions for each lambda
+  y_pred_matrix <- predict(fit, newx = X, s = fit$lambda)
+  
+  # RSS for each lambda
+  RSS_vec <- colSums((y - y_pred_matrix)^2)
+  
+  # ---- Compute degrees of freedom for each lambda ----
+  df_vec <- sapply(fit$lambda, function(lam) {
+    compute_ridge_df(X_std, lam)
+  })
+  
+  # ---- Compute BIC: log(RSS) + (log(T)/T) * df ----
+  bic_penalty <- log(T) / T
+  BIC_vec <- log(RSS_vec) + bic_penalty * df_vec
+  
+  # ---- Find optimal lambda ----
+  idx_best <- which.min(BIC_vec)
+  lambda_best <- fit$lambda[idx_best]
+  
+  # ---- Create results table ----
+  bic_tbl <- data.frame(
+    lambda = fit$lambda,
+    RSS = RSS_vec,
+    df = df_vec,
+    BIC = BIC_vec,
+    is_best = (fit$lambda == lambda_best)
+  )
+  
+  # ---- Return results ----
+  return(list(
+    lambda_best = lambda_best,
+    bic_tbl = bic_tbl,
+    fit = fit,
+    X_mean = X_mean,
+    X_sd = X_sd
+  ))
+}
+
+# Function 3: Helper to select lambda by BIC
+# Dispatches based on alpha (0=Ridge, 1=Lasso)
+select_lambda_bic <- function(X, y, alpha = 0, lambdas = NULL) {
+  
+  if (is.null(lambdas)) {
+    # Generate default lambda sequence (glmnet default behavior)
+    lambdas <- 10^seq(5, -2, length.out = 100)
+  }
+  
+  if (alpha == 0) {
+    # Ridge Regression
+    result <- fit_ridge_bic(X, y, alpha = 0, lambdas = lambdas)
+  } else if (alpha == 1) {
+    # LASSO (not implemented yet, but structure ready)
+    stop("LASSO not yet implemented. Use alpha=0 for Ridge.")
+  } else {
+    stop("alpha must be 0 (Ridge) or 1 (LASSO)")
+  }
+  
+  return(result)
+}
+
+```
+
+## Example: Ridge Regression with BIC Lambda Selection
+
+```{r}
+# ---- Fit Ridge Regression using BIC for lambda selection ----
+
+# Generate lambda sequence (smaller grid)
+lambdas <- 10^seq(5, -2, length.out = 100)
+
+# Fit ridge with BIC
+ridge_result <- select_lambda_bic(X_train, y_train, alpha = 0, lambdas = lambdas)
+
+cat("\n=== Ridge Regression: BIC-based Lambda Selection ===\n")
+cat("Optimal λ:", round(ridge_result$lambda_best, 6), "\n")
+cat("Training size (T):", nrow(X_train), "\n")
+
+# Display top 10 lambdas by BIC
+top_bics <- ridge_result$bic_tbl %>%
+  arrange(BIC) %>%
+  head(10)
+
+cat("\nTop 10 λ values by BIC:\n")
+print(top_bics)
+
+```
+
+```{r}
+# ---- Predict on test set ----
+
+# Extract the fitted model
+fit <- ridge_result$fit
+lambda_opt <- ridge_result$lambda_best
+
+# Predict on test data
+y_pred_test <- predict(fit, newx = X_test, s = lambda_opt)
+
+# Compute test metrics
+mae_ridge <- mae(y_test, y_pred_test)
+rmse_ridge <- rmse(y_test, y_pred_test)
+r2_ridge <- cor(y_test, y_pred_test)^2
+
+cat("\n=== Ridge Regression Test Performance ===\n")
+cat("MAE :", round(mae_ridge, 6), "\n")
+cat("RMSE:", round(rmse_ridge, 6), "\n")
+cat("R²  :", round(r2_ridge, 4), "\n")
+
+```
+
+```{r}
+# ---- Visualize BIC curve ----
+
+ggplot(ridge_result$bic_tbl, aes(x = log10(lambda), y = BIC)) +
+  geom_line(color = "steelblue") +
+  geom_point(data = ridge_result$bic_tbl %>% filter(is_best), 
+             color = "red", size = 3) +
+  labs(
+    title = "Ridge Regression: BIC vs Log10(λ)",
+    x = "Log10(λ)",
+    y = "BIC",
+    subtitle = paste("Optimal λ =", round(ridge_result$lambda_best, 6))
+  ) +
+  theme_minimal() +
+  theme(plot.subtitle = element_text(face = "italic"))
+
+```
+
+```{r}
+# ---- Extract and display coefficients ----
+
+# Get coefficients at optimal lambda
+coefs <- coef(fit, s = lambda_opt)
+
+# Convert to data frame for better display
+coefs_df <- data.frame(
+  feature = rownames(coefs),
+  coefficient = as.numeric(coefs)
+)
+
+# Extract and display intercept
+intercept <- coefs_df %>% filter(feature == "(Intercept)") %>% pull(coefficient)
+
+cat("\n=== Ridge Regression Intercept (λ =", round(lambda_opt, 6), ") ===\n")
+cat("Intercept:", round(intercept, 8), "\n")
+
+# Remove intercept row for feature coefficients display
+coefs_df <- coefs_df %>% filter(feature != "(Intercept)")
+
+# Sort by absolute value for easier interpretation
+coefs_df <- coefs_df %>%
+  mutate(abs_coef = abs(coefficient)) %>%
+  arrange(desc(abs_coef))
+
+cat("\n=== Ridge Regression Coefficients (λ =", round(lambda_opt, 6), ") ===\n")
+print(coefs_df)
+
+```
+
+```{r}
+# ---- Visualize coefficients ----
+
+ggplot(coefs_df, aes(x = reorder(feature, coefficient), y = coefficient, fill = coefficient > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("steelblue", "coral"), guide = "none") +
+  labs(
+    title = "Ridge Regression Coefficients",
+    x = "Feature",
+    y = "Coefficient Value"
+  ) +
+  coord_flip() +
+  theme_minimal()
+
+```
+
+```{r}
+# ---- Visualize forecasted vs actual returns on test set ----
+
+# Create a data frame for plotting
+test_results <- data.frame(
+  date = test_data$date,
+  actual = y_test,
+  forecasted = as.numeric(y_pred_test),
+  obs_num = seq_along(y_test)
+)
+
+# Line plot: Forecasted vs Actual
+ggplot(test_results, aes(x = date)) +
+  geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
+  geom_line(aes(y = forecasted, color = "Ridge Forecast"), linewidth = 0.8, linetype = "dashed") +
+  labs(
+    title = "Ridge Regression: Forecasted vs Actual Returns (Test Set)",
+    x = "Date",
+    y = "Log Return",
+    color = "Series"
+  ) +
+  scale_color_manual(values = c("Actual" = "steelblue", "Ridge Forecast" = "coral")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+# ---- Scatter plot: Forecasted vs Actual ----
+
+ggplot(test_results, aes(x = actual, y = forecasted)) +
+  geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Ridge Regression: Forecast Accuracy (Test Set)",
+    x = "Actual Return",
+    y = "Forecasted Return",
+    subtitle = paste("R² =", round(r2_ridge, 4), "| RMSE =", round(rmse_ridge, 6))
+  ) +
+  theme_minimal() +
+  coord_fixed(ratio = 1)
+
+```
+
+```{r}
+# ---- Save Ridge Regression Predictions and Results ----
+
+# Create results dataframe with predictions
+ridge_predictions <- test_results %>%
+  select(date, actual, forecasted) %>%
+  rename(
+    ridge_forecast = forecasted,
+    ridge_actual = actual
+  )
+
+# Save predictions to CSV
+write.csv(ridge_predictions, "../data/ridge_predictions.csv", row.names = FALSE)
+
+# Save model evaluation metrics
+ridge_metrics <- data.frame(
+  model = "Ridge Regression",
+  optimal_lambda = ridge_result$lambda_best,
+  MAE = mae_ridge,
+  RMSE = rmse_ridge,
+  R2 = r2_ridge
+)
+
+write.csv(ridge_metrics, "../data/ridge_metrics.csv", row.names = FALSE)
+
+# Save BIC table
+write.csv(ridge_result$bic_tbl, "../data/ridge_bic_table.csv", row.names = FALSE)
+
+cat("\n=== Ridge Regression Results Saved ===\n")
+cat("✓ Predictions saved to: ../data/ridge_predictions.csv\n")
+cat("✓ Metrics saved to: ../data/ridge_metrics.csv\n")
+cat("✓ BIC table saved to: ../data/ridge_bic_table.csv\n")
+
+```
