@@ -1,8 +1,8 @@
 ---
-title: "Ridge Regression"
+title: "LASSO Regression"
 author: "marth"
 output: html_document
-date: "2025-11-10"
+date: "2025-11-11"
 ---
 
 ```{r setup, include=FALSE}
@@ -40,7 +40,7 @@ data <- data %>%
 
 ```
 
-## Ridge Regression Model
+## LASSO Regression Model
 
 # ============================================================================
 # MODELING APPROACH: 80/20 Train-Test Split w/ Recursive CV
@@ -49,14 +49,14 @@ data <- data %>%
 ```{r}
 # --- STEP 1: Prepare data ---
 
-ridge_df <- data %>%
+lasso_df <- data %>%
   arrange(date) %>%
   select(-mean_prevailing_ret) %>%
   drop_na()
 
 set.seed(123)
 
-n <- nrow(ridge_df)
+n <- nrow(lasso_df)
 train_size <- floor(0.8 * n)  # 80% training
 test_size <- n - train_size   # 20% testing
 
@@ -64,8 +64,8 @@ cat("\n=== Data Split ===\n")
 cat("Training:", train_size, "observations\n")
 cat("Testing :", test_size, "observations\n")
 
-train_data <- ridge_df[1:train_size, ]
-test_data  <- ridge_df[(train_size + 1):n, ]
+train_data <- lasso_df[1:train_size, ]
+test_data  <- lasso_df[(train_size + 1):n, ]
 
 # Extract features and target
 X_train <- train_data %>% select(-date, -log_ret) %>% as.matrix()
@@ -86,21 +86,16 @@ cat("\nFeatures in model:", ncol(X_train), "\n")
 # BIC(λ) = log(RSS(λ)) + (log(T)/T)·df(λ)
 # ============================================================================
 
-# Function 1: Compute degrees of freedom for Ridge Regression
-# df(λ) = Σ_i d_i^2/(d_i^2+λ) where d_i are singular values of standardized X
-compute_ridge_df <- function(X_standardized, lambda) {
-  # Singular value decomposition
-  svd_result <- svd(X_standardized)
-  d <- svd_result$d  # singular values
-  
-  # df(λ) = sum(d_i^2 / (d_i^2 + λ))
-  df <- sum((d^2) / (d^2 + lambda))
-  
+# Function 1: Compute degrees of freedom for LASSO
+# df(λ) = number of non-zero coefficients
+compute_lasso_df <- function(coef_matrix) {
+  # Count non-zero coefficients (excluding intercept)
+  df <- sum(coef_matrix != 0)
   return(df)
 }
 
-# Function 2: Fit Ridge Regression and compute BIC for each lambda
-fit_ridge_bic <- function(X, y, alpha = 0, lambdas = NULL) {
+# Function 2: Fit LASSO Regression and compute BIC for each lambda
+fit_lasso_bic <- function(X, y, alpha = 1, lambdas = NULL) {
   
   # ---- Input validation ----
   T <- nrow(X)
@@ -108,12 +103,7 @@ fit_ridge_bic <- function(X, y, alpha = 0, lambdas = NULL) {
   if (length(y) != T) stop("X and y must have same number of rows")
   if (!is.matrix(X)) X <- as.matrix(X)
   
-  # ---- Standardize X (glmnet standardizes internally, but we do it for df calculation) ----
-  X_mean <- colMeans(X)
-  X_sd <- apply(X, 2, sd)
-  X_std <- scale(X, center = X_mean, scale = X_sd)
-  
-  # Fit glmnet (ridge: alpha=0, standardize=TRUE, intercept=TRUE)
+  # Fit glmnet (lasso: alpha=1, standardize=TRUE, intercept=TRUE)
   fit <- glmnet(X, y, alpha = alpha, standardize = TRUE, intercept = TRUE, 
                 lambda = lambdas, thresh = 1e-7)
   
@@ -125,9 +115,9 @@ fit_ridge_bic <- function(X, y, alpha = 0, lambdas = NULL) {
   RSS_vec <- colSums((y - y_pred_matrix)^2)
   
   # ---- Compute degrees of freedom for each lambda ----
-  df_vec <- sapply(fit$lambda, function(lam) {
-    compute_ridge_df(X_std, lam)
-  })
+  # For LASSO: df = number of non-zero coefficients
+  coef_matrix <- coef(fit)[-1, ]  # exclude intercept
+  df_vec <- colSums(coef_matrix != 0)
   
   # ---- Compute BIC: log(RSS) + (log(T)/T) * df ----
   bic_penalty <- log(T) / T
@@ -150,27 +140,25 @@ fit_ridge_bic <- function(X, y, alpha = 0, lambdas = NULL) {
   return(list(
     lambda_best = lambda_best,
     bic_tbl = bic_tbl,
-    fit = fit,
-    X_mean = X_mean,
-    X_sd = X_sd
+    fit = fit
   ))
 }
 
 # Function 3: Helper to select lambda by BIC
 # Dispatches based on alpha (0=Ridge, 1=Lasso)
-select_lambda_bic <- function(X, y, alpha = 0, lambdas = NULL) {
+select_lambda_bic <- function(X, y, alpha = 1, lambdas = NULL) {
   
   if (is.null(lambdas)) {
     # Generate default lambda sequence (glmnet default behavior)
     lambdas <- 10^seq(5, -2, length.out = 100)
   }
   
-  if (alpha == 0) {
-    # Ridge Regression
-    result <- fit_ridge_bic(X, y, alpha = 0, lambdas = lambdas)
-  } else if (alpha == 1) {
-    # LASSO (not implemented yet, but structure ready)
-    stop("LASSO not yet implemented. Use alpha=0 for Ridge.")
+  if (alpha == 1) {
+    # LASSO Regression
+    result <- fit_lasso_bic(X, y, alpha = 1, lambdas = lambdas)
+  } else if (alpha == 0) {
+    # Ridge (not implemented here, but structure ready)
+    stop("Ridge not implemented in this file. Use alpha=1 for LASSO.")
   } else {
     stop("alpha must be 0 (Ridge) or 1 (LASSO)")
   }
@@ -180,23 +168,23 @@ select_lambda_bic <- function(X, y, alpha = 0, lambdas = NULL) {
 
 ```
 
-## Example: Ridge Regression with BIC Lambda Selection
+## Example: LASSO Regression with BIC Lambda Selection
 
 ```{r}
-# ---- Fit Ridge Regression using BIC for lambda selection ----
+# ---- Fit LASSO Regression using BIC for lambda selection ----
 
-# Generate lambda sequence (smaller grid)
-lambdas <- 10^seq(5, -2, length.out = 100)
+# Generate lambda sequence (smaller range)
+lambdas <- 10^seq(2, -5, length.out = 50)
 
-# Fit ridge with BIC
-ridge_result <- select_lambda_bic(X_train, y_train, alpha = 0, lambdas = lambdas)
+# Fit lasso with BIC
+lasso_result <- select_lambda_bic(X_train, y_train, alpha = 1, lambdas = lambdas)
 
-cat("\n=== Ridge Regression: BIC-based Lambda Selection ===\n")
-cat("Optimal λ:", round(ridge_result$lambda_best, 6), "\n")
+cat("\n=== LASSO Regression: BIC-based Lambda Selection ===\n")
+cat("Optimal λ:", round(lasso_result$lambda_best, 6), "\n")
 cat("Training size (T):", nrow(X_train), "\n")
 
 # Display top 10 lambdas by BIC
-top_bics <- ridge_result$bic_tbl %>%
+top_bics <- lasso_result$bic_tbl %>%
   arrange(BIC) %>%
   head(10)
 
@@ -209,36 +197,36 @@ print(top_bics)
 # ---- Predict on test set ----
 
 # Extract the fitted model
-fit <- ridge_result$fit
-lambda_opt <- ridge_result$lambda_best
+fit <- lasso_result$fit
+lambda_opt <- lasso_result$lambda_best
 
 # Predict on test data
 y_pred_test <- predict(fit, newx = X_test, s = lambda_opt)
 
 # Compute test metrics
-mae_ridge <- mae(y_test, y_pred_test)
-rmse_ridge <- rmse(y_test, y_pred_test)
-r2_ridge <- cor(y_test, y_pred_test)^2
+mae_lasso <- mae(y_test, y_pred_test)
+rmse_lasso <- rmse(y_test, y_pred_test)
+r2_lasso <- cor(y_test, y_pred_test)^2
 
-cat("\n=== Ridge Regression Test Performance ===\n")
-cat("MAE :", round(mae_ridge, 6), "\n")
-cat("RMSE:", round(rmse_ridge, 6), "\n")
-cat("R²  :", round(r2_ridge, 4), "\n")
+cat("\n=== LASSO Regression Test Performance ===\n")
+cat("MAE :", round(mae_lasso, 6), "\n")
+cat("RMSE:", round(rmse_lasso, 6), "\n")
+cat("R²  :", round(r2_lasso, 4), "\n")
 
 ```
 
 ```{r}
 # ---- Visualize BIC curve ----
 
-ggplot(ridge_result$bic_tbl, aes(x = log10(lambda), y = BIC)) +
+ggplot(lasso_result$bic_tbl, aes(x = log10(lambda), y = BIC)) +
   geom_line(color = "steelblue") +
-  geom_point(data = ridge_result$bic_tbl %>% filter(is_best), 
+  geom_point(data = lasso_result$bic_tbl %>% filter(is_best), 
              color = "red", size = 3) +
   labs(
-    title = "Ridge Regression: BIC vs Log10(λ)",
+    title = "LASSO Regression: BIC vs Log10(λ)",
     x = "Log10(λ)",
     y = "BIC",
-    subtitle = paste("Optimal λ =", round(ridge_result$lambda_best, 6))
+    subtitle = paste("Optimal λ =", round(lasso_result$lambda_best, 6))
   ) +
   theme_minimal() +
   theme(plot.subtitle = element_text(face = "italic"))
@@ -260,7 +248,7 @@ coefs_df <- data.frame(
 # Extract and display intercept
 intercept <- coefs_df %>% filter(feature == "(Intercept)") %>% pull(coefficient)
 
-cat("\n=== Ridge Regression Intercept (λ =", round(lambda_opt, 6), ") ===\n")
+cat("\n=== LASSO Regression Intercept (λ =", round(lambda_opt, 6), ") ===\n")
 cat("Intercept:", round(intercept, 8), "\n")
 
 # Remove intercept row for feature coefficients display
@@ -271,7 +259,8 @@ coefs_df <- coefs_df %>%
   mutate(abs_coef = abs(coefficient)) %>%
   arrange(desc(abs_coef))
 
-cat("\n=== Ridge Regression Coefficients (λ =", round(lambda_opt, 6), ") ===\n")
+cat("\n=== LASSO Regression Coefficients (λ =", round(lambda_opt, 6), ") ===\n")
+cat("Number of non-zero coefficients:", sum(coefs_df$coefficient != 0), "\n")
 print(coefs_df)
 
 ```
@@ -283,7 +272,7 @@ ggplot(coefs_df, aes(x = reorder(feature, coefficient), y = coefficient, fill = 
   geom_col() +
   scale_fill_manual(values = c("steelblue", "coral"), guide = "none") +
   labs(
-    title = "Ridge Regression Coefficients",
+    title = "LASSO Regression Coefficients",
     x = "Feature",
     y = "Coefficient Value"
   ) +
@@ -306,14 +295,14 @@ test_results <- data.frame(
 # Line plot: Forecasted vs Actual
 ggplot(test_results, aes(x = date)) +
   geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
-  geom_line(aes(y = forecasted, color = "Ridge Forecast"), linewidth = 0.8, linetype = "dashed") +
+  geom_line(aes(y = forecasted, color = "LASSO Forecast"), linewidth = 0.8, linetype = "dashed") +
   labs(
-    title = "Ridge Regression: Forecasted vs Actual Returns (Test Set)",
+    title = "LASSO Regression: Forecasted vs Actual Returns (Test Set)",
     x = "Date",
     y = "Log Return",
     color = "Series"
   ) +
-  scale_color_manual(values = c("Actual" = "steelblue", "Ridge Forecast" = "coral")) +
+  scale_color_manual(values = c("Actual" = "steelblue", "LASSO Forecast" = "coral")) +
   theme_minimal() +
   theme(legend.position = "bottom")
 
@@ -326,10 +315,10 @@ ggplot(test_results, aes(x = actual, y = forecasted)) +
   geom_point(alpha = 0.6, color = "steelblue", size = 2) +
   geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
   labs(
-    title = "Ridge Regression: Forecast Accuracy (Test Set)",
+    title = "LASSO Regression: Forecast Accuracy (Test Set)",
     x = "Actual Return",
     y = "Forecasted Return",
-    subtitle = paste("R² =", round(r2_ridge, 4), "| RMSE =", round(rmse_ridge, 6))
+    subtitle = paste("R² =", round(r2_lasso, 4), "| RMSE =", round(rmse_lasso, 6))
   ) +
   theme_minimal() +
   coord_fixed(ratio = 1)
@@ -337,36 +326,36 @@ ggplot(test_results, aes(x = actual, y = forecasted)) +
 ```
 
 ```{r}
-# ---- Save Ridge Regression Predictions and Results ----
+# ---- Save LASSO Regression Predictions and Results ----
 
 # Create results dataframe with predictions
-ridge_predictions <- test_results %>%
+lasso_predictions <- test_results %>%
   select(date, actual, forecasted) %>%
   rename(
-    ridge_forecast = forecasted,
-    ridge_actual = actual
+    lasso_forecast = forecasted,
+    lasso_actual = actual
   )
 
 # Save predictions to CSV
-write.csv(ridge_predictions, "../data/ridge_predictions.csv", row.names = FALSE)
+write.csv(lasso_predictions, "../data/lasso_predictions.csv", row.names = FALSE)
 
 # Save model evaluation metrics
-ridge_metrics <- data.frame(
-  model = "Ridge Regression",
-  optimal_lambda = ridge_result$lambda_best,
-  MAE = mae_ridge,
-  RMSE = rmse_ridge,
-  R2 = r2_ridge
+lasso_metrics <- data.frame(
+  model = "LASSO Regression",
+  optimal_lambda = lasso_result$lambda_best,
+  MAE = mae_lasso,
+  RMSE = rmse_lasso,
+  R2 = r2_lasso
 )
 
-# write.csv(ridge_metrics, "../data/ridge_metrics.csv", row.names = FALSE)
+write.csv(lasso_metrics, "../data/lasso_metrics.csv", row.names = FALSE)
 
 # Save BIC table
-# write.csv(ridge_result$bic_tbl, "../data/ridge_bic_table.csv", row.names = FALSE)
+write.csv(lasso_result$bic_tbl, "../data/lasso_bic_table.csv", row.names = FALSE)
 
-cat("\n=== Ridge Regression Results Saved ===\n")
-cat("✓ Predictions saved to: ../data/ridge_predictions.csv\n")
-cat("✓ Metrics saved to: ../data/ridge_metrics.csv\n")
-cat("✓ BIC table saved to: ../data/ridge_bic_table.csv\n")
+cat("\n=== LASSO Regression Results Saved ===\n")
+cat("✓ Predictions saved to: ../data/lasso_predictions.csv\n")
+cat("✓ Metrics saved to: ../data/lasso_metrics.csv\n")
+cat("✓ BIC table saved to: ../data/lasso_bic_table.csv\n")
 
 ```
