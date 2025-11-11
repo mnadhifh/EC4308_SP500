@@ -99,9 +99,39 @@ xgb_forecasts <- read_csv("../data/xgb_evals.csv") %>%
   select(date, xgb_forecast_ret) %>%
   arrange(date)
 
+# Load Lasso predictions
+lasso_forecasts <- read_csv("../data/lasso_predictions.csv") %>%
+  select(date, lasso_forecast_ret) %>%
+  arrange(date)
+
+# Load Ridge predictions
+ridge_forecasts <- read_csv("../data/ridge_predictions.csv") %>%
+  select(date, ridge_forecast_ret) %>%
+  arrange(date)
+
+# Load PCR predictions
+pcr_forecasts <- read_csv("../data/pcr_predictions.csv") %>%
+  select(date, pcr_forecast_ret) %>%
+  arrange(date)
+
+# Load Elastic Net predictions
+elastic_forecasts <- read_csv("../data/elastic_predictions.csv") %>%
+  select(date, elastic_forecast_ret) %>%
+  arrange(date)
+
+# Load Ensemble predictions (from ensemble_lsei.Rmd)
+ensemble_forecasts <- read_csv("../data/ensemble_predictions.csv") %>%
+  select(date, ensemble_forecast_ret) %>%
+  arrange(date)
+
 # Combine all forecasts
 forecast_data <- rf_forecasts %>%
-  left_join(xgb_forecasts, by = "date")
+  left_join(xgb_forecasts, by = "date") %>%
+  left_join(lasso_forecasts, by = "date") %>%
+  left_join(ridge_forecasts, by = "date") %>%
+  left_join(pcr_forecasts, by = "date") %>%
+  left_join(elastic_forecasts, by = "date") %>%
+  left_join(ensemble_forecasts, by = "date")
 
 cat("Forecast data loaded:", nrow(forecast_data), "quarterly observations\n")
 cat("Date range:", min(forecast_data$date), "to", max(forecast_data$date), "\n")
@@ -110,6 +140,11 @@ cat("  - date: Quarter dates\n")
 cat("  - log_ret: Actual S&P 500 quarterly returns\n")
 cat("  - rf_forecast_ret: Random Forest predictions\n")
 cat("  - xgb_forecast_ret: XGBoost predictions\n")
+cat("  - lasso_forecast_ret: Lasso predictions\n")
+cat("  - ridge_forecast_ret: Ridge predictions\n")
+cat("  - pcr_forecast_ret: PCR predictions\n")
+cat("  - elastic_forecast_ret: Elastic Net predictions\n")
+cat("  - ensemble_forecast_ret: Ensemble (LSEI) predictions\n")
 cat("\nSample data:\n")
 head(forecast_data, 10)
 ```
@@ -144,6 +179,11 @@ cat("  - date: Quarter dates\n")
 cat("  - log_ret: Actual S&P 500 returns (realized)\n")
 cat("  - rf_forecast_ret: Random Forest forecasts\n")
 cat("  - xgb_forecast_ret: XGBoost forecasts\n")
+cat("  - lasso_forecast_ret: Lasso forecasts\n")
+cat("  - ridge_forecast_ret: Ridge forecasts\n")
+cat("  - pcr_forecast_ret: PCR forecasts\n")
+cat("  - elastic_forecast_ret: Elastic Net forecasts\n")
+cat("  - ensemble_forecast_ret: Ensemble (LSEI) forecasts\n")
 cat("  - tbill_quarterly_return: T-bill returns (risk-free alternative)\n")
 cat("\nSample merged data:\n")
 head(backtest_data, 10)
@@ -435,8 +475,83 @@ backtest_xgb <- tactical_strategy_backtest(
   transaction_cost = TRANSACTION_COST
 )
 
-# Backtest 3: Buy-and-Hold Benchmarks
-cat("\n3. Buy-and-Hold S&P 500 Benchmark\n")
+# Backtest 3: Lasso Strategy
+cat("\n3. Lasso Tactical Strategy\n")
+predictions_lasso <- backtest_data %>% 
+  select(date, predicted_sp500_return = lasso_forecast_ret)
+
+backtest_lasso <- tactical_strategy_backtest(
+  predictions = predictions_lasso,
+  actual_returns = actual_returns,
+  tbill_returns = tbill_returns,
+  start_date = START_DATE,
+  end_date = END_DATE,
+  initial_capital = INITIAL_CAPITAL,
+  transaction_cost = TRANSACTION_COST
+)
+
+# Backtest 4: Ridge Strategy
+cat("\n4. Ridge Tactical Strategy\n")
+predictions_ridge <- backtest_data %>% 
+  select(date, predicted_sp500_return = ridge_forecast_ret)
+
+backtest_ridge <- tactical_strategy_backtest(
+  predictions = predictions_ridge,
+  actual_returns = actual_returns,
+  tbill_returns = tbill_returns,
+  start_date = START_DATE,
+  end_date = END_DATE,
+  initial_capital = INITIAL_CAPITAL,
+  transaction_cost = TRANSACTION_COST
+)
+
+# Backtest 5: PCR Strategy
+cat("\n5. PCR Tactical Strategy\n")
+predictions_pcr <- backtest_data %>% 
+  select(date, predicted_sp500_return = pcr_forecast_ret)
+
+backtest_pcr <- tactical_strategy_backtest(
+  predictions = predictions_pcr,
+  actual_returns = actual_returns,
+  tbill_returns = tbill_returns,
+  start_date = START_DATE,
+  end_date = END_DATE,
+  initial_capital = INITIAL_CAPITAL,
+  transaction_cost = TRANSACTION_COST
+)
+
+# Backtest 6: Elastic Net Strategy
+cat("\n6. Elastic Net Tactical Strategy\n")
+predictions_elastic <- backtest_data %>% 
+  select(date, predicted_sp500_return = elastic_forecast_ret)
+
+backtest_elastic <- tactical_strategy_backtest(
+  predictions = predictions_elastic,
+  actual_returns = actual_returns,
+  tbill_returns = tbill_returns,
+  start_date = START_DATE,
+  end_date = END_DATE,
+  initial_capital = INITIAL_CAPITAL,
+  transaction_cost = TRANSACTION_COST
+)
+
+# Backtest 7: Ensemble (LSEI) Strategy
+cat("\n7. Ensemble (LSEI) Tactical Strategy\n")
+predictions_ensemble <- backtest_data %>% 
+  select(date, predicted_sp500_return = ensemble_forecast_ret)
+
+backtest_ensemble <- tactical_strategy_backtest(
+  predictions = predictions_ensemble,
+  actual_returns = actual_returns,
+  tbill_returns = tbill_returns,
+  start_date = START_DATE,
+  end_date = END_DATE,
+  initial_capital = INITIAL_CAPITAL,
+  transaction_cost = TRANSACTION_COST
+)
+
+# Backtest 8: Buy-and-Hold Benchmarks
+cat("\n8. Buy-and-Hold S&P 500 Benchmark\n")
 benchmark_sp500 <- buy_hold_sp500(
   actual_returns = actual_returns,
   start_date = START_DATE,
@@ -444,7 +559,7 @@ benchmark_sp500 <- buy_hold_sp500(
   initial_capital = INITIAL_CAPITAL
 )
 
-cat("\n4. Buy-and-Hold T-Bill Benchmark\n")
+cat("\n9. Buy-and-Hold T-Bill Benchmark\n")
 benchmark_tbill <- buy_hold_tbill(
   tbill_returns = tbill_returns,
   start_date = START_DATE,
@@ -452,7 +567,7 @@ benchmark_tbill <- buy_hold_tbill(
   initial_capital = INITIAL_CAPITAL
 )
 
-cat("\n5. Perfect Foresight Benchmark (Oracle)\n")
+cat("\n10. Perfect Foresight Benchmark (Oracle)\n")
 cat("Note: This uses actual realized returns as predictions\n")
 cat("      It represents the theoretical maximum tactical strategy performance\n")
 predictions_all_right <- backtest_data %>% 
@@ -505,12 +620,17 @@ benchmark_tbill <- buy_hold_tbill(
 ```{r performance-table}
 # Create performance comparison table
 performance_table <- data.frame(
-  Strategy = c("Random Forest Tactical", "XGBoost Tactical", 
-               "Buy-Hold S&P500", "Buy-Hold T-Bill", "Perfect Foresight (Oracle)"),
+  Strategy = c("Random Forest", "XGBoost", "Lasso", "Ridge", "PCR", "Elastic Net",
+               "Ensemble (LSEI)", "Buy-Hold S&P500", "Buy-Hold T-Bill", "Perfect Foresight"),
   
   Total_Return = percent(c(
     backtest_rf$metrics$total_return,
     backtest_xgb$metrics$total_return,
+    backtest_lasso$metrics$total_return,
+    backtest_ridge$metrics$total_return,
+    backtest_pcr$metrics$total_return,
+    backtest_elastic$metrics$total_return,
+    backtest_ensemble$metrics$total_return,
     benchmark_sp500$metrics$total_return,
     benchmark_tbill$metrics$total_return,
     benchmark_all_right$metrics$total_return
@@ -519,6 +639,11 @@ performance_table <- data.frame(
   Annualized_Return = percent(c(
     backtest_rf$metrics$annualized_return,
     backtest_xgb$metrics$annualized_return,
+    backtest_lasso$metrics$annualized_return,
+    backtest_ridge$metrics$annualized_return,
+    backtest_pcr$metrics$annualized_return,
+    backtest_elastic$metrics$annualized_return,
+    backtest_ensemble$metrics$annualized_return,
     benchmark_sp500$metrics$annualized_return,
     benchmark_tbill$metrics$annualized_return,
     benchmark_all_right$metrics$annualized_return
@@ -527,6 +652,11 @@ performance_table <- data.frame(
   Sharpe_Ratio = c(
     round(backtest_rf$metrics$sharpe_ratio, 3),
     round(backtest_xgb$metrics$sharpe_ratio, 3),
+    round(backtest_lasso$metrics$sharpe_ratio, 3),
+    round(backtest_ridge$metrics$sharpe_ratio, 3),
+    round(backtest_pcr$metrics$sharpe_ratio, 3),
+    round(backtest_elastic$metrics$sharpe_ratio, 3),
+    round(backtest_ensemble$metrics$sharpe_ratio, 3),
     NA,  # Buy-Hold S&P500
     NA,  # Buy-Hold T-Bill
     round(benchmark_all_right$metrics$sharpe_ratio, 3)
@@ -535,6 +665,11 @@ performance_table <- data.frame(
   Max_Drawdown = percent(c(
     backtest_rf$metrics$max_drawdown,
     backtest_xgb$metrics$max_drawdown,
+    backtest_lasso$metrics$max_drawdown,
+    backtest_ridge$metrics$max_drawdown,
+    backtest_pcr$metrics$max_drawdown,
+    backtest_elastic$metrics$max_drawdown,
+    backtest_ensemble$metrics$max_drawdown,
     NA,  # Buy-Hold S&P500
     NA,  # Buy-Hold T-Bill
     benchmark_all_right$metrics$max_drawdown
@@ -543,6 +678,11 @@ performance_table <- data.frame(
   Win_Rate = percent(c(
     backtest_rf$metrics$win_rate,
     backtest_xgb$metrics$win_rate,
+    backtest_lasso$metrics$win_rate,
+    backtest_ridge$metrics$win_rate,
+    backtest_pcr$metrics$win_rate,
+    backtest_elastic$metrics$win_rate,
+    backtest_ensemble$metrics$win_rate,
     NA,  # Buy-Hold S&P500
     NA,  # Buy-Hold T-Bill
     benchmark_all_right$metrics$win_rate
@@ -551,6 +691,11 @@ performance_table <- data.frame(
   Turnover = percent(c(
     backtest_rf$metrics$turnover,
     backtest_xgb$metrics$turnover,
+    backtest_lasso$metrics$turnover,
+    backtest_ridge$metrics$turnover,
+    backtest_pcr$metrics$turnover,
+    backtest_elastic$metrics$turnover,
+    backtest_ensemble$metrics$turnover,
     NA,  # Buy-Hold S&P500
     NA,  # Buy-Hold T-Bill
     benchmark_all_right$metrics$turnover
@@ -559,6 +704,11 @@ performance_table <- data.frame(
   N_Switches = c(
     backtest_rf$metrics$n_switches,
     backtest_xgb$metrics$n_switches,
+    backtest_lasso$metrics$n_switches,
+    backtest_ridge$metrics$n_switches,
+    backtest_pcr$metrics$n_switches,
+    backtest_elastic$metrics$n_switches,
+    backtest_ensemble$metrics$n_switches,
     0,  # Buy-Hold S&P500
     0,  # Buy-Hold T-Bill
     benchmark_all_right$metrics$n_switches
@@ -567,6 +717,11 @@ performance_table <- data.frame(
   Final_Value = round(c(
     backtest_rf$metrics$final_value,
     backtest_xgb$metrics$final_value,
+    backtest_lasso$metrics$final_value,
+    backtest_ridge$metrics$final_value,
+    backtest_pcr$metrics$final_value,
+    backtest_elastic$metrics$final_value,
+    backtest_ensemble$metrics$final_value,
     benchmark_sp500$metrics$final_value,
     benchmark_tbill$metrics$final_value,
     benchmark_all_right$metrics$final_value
@@ -589,23 +744,35 @@ kable(performance_table, align = "lrrrrrrrr",
 
 # Combine all portfolio value trajectories
 portfolio_comparison <- bind_rows(
-  backtest_rf$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Random Forest Tactical"),
-  backtest_xgb$results %>% select(date, portfolio_value) %>% mutate(Strategy = "XGBoost Tactical"),
+  backtest_rf$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Random Forest"),
+  backtest_xgb$results %>% select(date, portfolio_value) %>% mutate(Strategy = "XGBoost"),
+  backtest_lasso$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Lasso"),
+  backtest_ridge$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Ridge"),
+  backtest_pcr$results %>% select(date, portfolio_value) %>% mutate(Strategy = "PCR"),
+  backtest_elastic$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Elastic Net"),
+  backtest_ensemble$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Ensemble (LSEI)"),
   benchmark_sp500$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Buy-Hold S&P 500"),
-  benchmark_all_right$results %>% select(date, portfolio_value) %>% mutate(Strategy = "all_righht"),
+  benchmark_all_right$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Perfect Foresight"),
   benchmark_tbill$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Buy-Hold T-Bill")
 )
 
 ggplot(portfolio_comparison, aes(x = date, y = portfolio_value, color = Strategy)) +
   geom_line(linewidth = 1) +
   scale_y_log10(labels = dollar_format()) +
-  scale_color_manual(values = c("Random Forest Tactical" = "red", 
-                                "all_righht"="green",
-                                 "XGBoost Tactical" = "blue", 
-                                 "Buy-Hold S&P 500" = "black",
-                                 "Buy-Hold T-Bill" = "gray50")) +
+  scale_color_manual(values = c(
+    "Random Forest" = "#E41A1C", 
+    "XGBoost" = "#377EB8",
+    "Lasso" = "#4DAF4A",
+    "Ridge" = "#984EA3",
+    "PCR" = "#FF7F00",
+    "Elastic Net" = "#FFFF33",
+    "Ensemble (LSEI)" = "#A65628",
+    "Perfect Foresight" = "#00FF00",
+    "Buy-Hold S&P 500" = "black",
+    "Buy-Hold T-Bill" = "gray50"
+  )) +
   labs(
-    title = "Portfolio Value Comparison: Tactical Strategies vs Benchmarks",
+    title = "Portfolio Value Comparison: All Strategies vs Benchmarks",
     subtitle = paste("Period:", START_DATE, "to", END_DATE, "| Log Scale"),
     x = "Date",
     y = "Portfolio Value ($)",
