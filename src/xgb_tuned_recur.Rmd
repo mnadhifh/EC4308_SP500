@@ -12,6 +12,7 @@ library(dplyr)
 library(tidyverse)
 library(lubridate)
 library(ggplot2)
+library(zoo)
 library(Metrics)
 library(forecast)
 library(xgboost)
@@ -31,6 +32,7 @@ data <- data %>%
     date,
     log_ret,
     matches("^price_fd_L[1-5]$"),
+    matches("^log_ret_L[1-5]$"),
     matches("_L[2-5]$")       # only lagged features from at least 2 periods ago
   ) %>%
   left_join(
@@ -154,9 +156,11 @@ cat("Prediction complete!\n")
 X_test_full <- test_data %>% select(-date, -log_ret)
 dtest_full  <- xgb.DMatrix(as.matrix(X_test_full))
 
+xgb_train_forecasts <- predict(xgb_model_final, dtrain_full)
+
 xgb_forecasts <- predict(xgb_model_final, dtest_full)
 
-xgb_df$xgb_forecast_ret <- c(rep(NA, train_size), xgb_forecasts)
+xgb_df$xgb_forecast_ret <- c(xgb_train_forecasts, xgb_forecasts)
 
 ```
 
@@ -330,5 +334,14 @@ ggplot(imp_top10, aes(x = Feature, y = Gain)) +
 # save model for later use 
 write_csv(xgb_df, "../data/xgb_results.csv")
 write_csv(xgb_eval_df, "../data/xgb_evals.csv")
+
+xgb_train_preds <- xgb_df %>%
+  head(train_size) %>%  
+  filter(
+    !is.na(log_ret),
+    !is.na(xgb_forecast_ret)
+  )
+
+write_csv(xgb_train_preds, "../data/xgb_train_predictions.csv")  
 
 ```
