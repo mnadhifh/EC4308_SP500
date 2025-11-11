@@ -85,20 +85,33 @@ cat("\nSample data (showing calculation):\n")
 head(tbill_data, 10)
 ```
 
-## 1.2 Load Actual S&P 500 Returns
-```{r load-sp500}
-cat("\nLoading actual S&P 500 returns...\n")
+## 1.2 Load ML Model Forecasts
+```{r load-forecasts}
+cat("Loading ML model forecasts and actual returns...\n")
 
-# Load from merged data (created in data cleaning script)
-actual_returns <- read.csv("../data/data_merged.csv") %>%
-  mutate(date = as.Date(date)) %>%
-  select(date, log_ret) %>%
-  rename(actual_sp500_return = log_ret) %>%
-  filter(!is.na(actual_sp500_return))
+# Load Random Forest predictions (from rf_tuned_recur.Rmd)
+rf_forecasts <- read_csv("../data/rf_evals.csv") %>%
+  select(date, log_ret, rf_forecast_ret) %>%
+  arrange(date)
 
-cat("Actual S&P 500 returns loaded:", nrow(actual_returns), "quarterly observations\n")
-cat("Date range:", min(actual_returns$date), "to", max(actual_returns$date), "\n")
-head(actual_returns)
+# Load XGBoost predictions (from xgb_tuned_recur.Rmd)
+xgb_forecasts <- read_csv("../data/xgb_evals.csv") %>%
+  select(date, xgb_forecast_ret) %>%
+  arrange(date)
+
+# Combine all forecasts
+forecast_data <- rf_forecasts %>%
+  left_join(xgb_forecasts, by = "date")
+
+cat("Forecast data loaded:", nrow(forecast_data), "quarterly observations\n")
+cat("Date range:", min(forecast_data$date), "to", max(forecast_data$date), "\n")
+cat("\nColumns available:\n")
+cat("  - date: Quarter dates\n")
+cat("  - log_ret: Actual S&P 500 quarterly returns\n")
+cat("  - rf_forecast_ret: Random Forest predictions\n")
+cat("  - xgb_forecast_ret: XGBoost predictions\n")
+cat("\nSample data:\n")
+head(forecast_data, 10)
 ```
 
 ## 1.3 Prepare T-Bill Data for Backtesting
@@ -114,54 +127,33 @@ cat("Sample:\n")
 head(tbill_quarterly, 10)
 ```
 
----
+## 1.4 Merge All Data for Backtesting
+```{r merge-data}
+cat("\n=== Merging Forecast Data with T-Bill Returns ===\n")
 
-# 2. Create Sample Forecast Data
+# Merge forecasts with T-bill returns
+backtest_data <- forecast_data %>%
+  left_join(tbill_quarterly, by = "date") %>%
+  drop_na()  # Remove any rows with missing data
 
-## 2.1 Sample Predictions (Placeholder)
-```{r sample-predictions}
-cat("\n=== CREATING SAMPLE FORECAST DATA ===\n")
-cat("Note: Replace this with actual ML model predictions later\n\n")
-
-# Create sample forecast data structure
-# In practice, this will come from your RF, XGBoost, Prevailing Mean models
-
-set.seed(123)
-
-# Generate sample predictions for last 52 quarters (matching your test set)
-# Dates: Q207-Q258 (approximately 2011-2024)
-sample_dates <- tail(actual_returns$date, 52)
-
-sample_forecasts <- data.frame(
-  date = sample_dates,
-  
-  # Sample Model 1: Optimistic predictions (higher than actual on average)
-  model1_predicted_return = actual_returns$actual_sp500_return[
-    (nrow(actual_returns)-51):nrow(actual_returns)
-  ] + rnorm(52, mean = 0.01, sd = 0.02),
-  
-  # Sample Model 2: Conservative predictions (lower than actual on average)
-  model2_predicted_return = actual_returns$actual_sp500_return[
-    (nrow(actual_returns)-51):nrow(actual_returns)
-  ] - rnorm(52, mean = 0.005, sd = 0.015),
-  
-  # Sample Model 3: Prevailing Mean (simple average)
-  model3_predicted_return = actual_returns$actual_sp500_return[
-    (nrow(actual_returns)-51):nrow(actual_returns)
-  ] + rnorm(52, mean = 0, sd = 0.01)
-)
-
-cat("Sample forecasts created for", nrow(sample_forecasts), "quarters\n")
-cat("Date range:", min(sample_forecasts$date), "to", max(sample_forecasts$date), "\n\n")
-
-print(head(sample_forecasts, 10))
+cat("\n=== Backtest Dataset Ready ===\n")
+cat("Total observations:", nrow(backtest_data), "quarters\n")
+cat("Date range:", min(backtest_data$date), "to", max(backtest_data$date), "\n")
+cat("\nColumns:\n")
+cat("  - date: Quarter dates\n")
+cat("  - log_ret: Actual S&P 500 returns (realized)\n")
+cat("  - rf_forecast_ret: Random Forest forecasts\n")
+cat("  - xgb_forecast_ret: XGBoost forecasts\n")
+cat("  - tbill_quarterly_return: T-bill returns (risk-free alternative)\n")
+cat("\nSample merged data:\n")
+head(backtest_data, 10)
 ```
 
 ---
 
-# 3. Backtesting Framework
+# 2. Backtesting Framework
 
-## 3.1 Define Strategy Function
+## 2.1 Define Strategy Function
 ```{r strategy-function}
 #' Tactical Asset Allocation Backtest
 #' 
@@ -383,13 +375,13 @@ buy_hold_tbill <- function(tbill_returns, start_date = NULL, end_date = NULL,
 
 ---
 
-# 4. Run Backtest
+# 3. Run Backtest
 
-## 4.1 Set Backtest Parameters
+## 3.1 Set Backtest Parameters
 ```{r backtest-params}
 # === USER PARAMETERS ===
-START_DATE <- "2011-01-01"  # Adjust to your test period
-END_DATE <- "2024-06-30"    # Adjust to your test period
+START_DATE <- "2012-01-01"  # First date in your test set (adjust if needed)
+END_DATE <- "2024-06-30"    # Last date in your test set
 INITIAL_CAPITAL <- 1
 TRANSACTION_COST <- 0.00    # 0% (can change to 0.001 for 0.1%, etc.)
 
@@ -400,54 +392,90 @@ cat("Initial Capital:", INITIAL_CAPITAL, "\n")
 cat("Transaction Cost:", TRANSACTION_COST * 100, "%\n\n")
 ```
 
-## 4.2 Run Strategy for Each Model
+## 3.2 Run Strategy for Each Model
 ```{r run-backtest}
-# Prepare prediction data for each model
-predictions_model1 <- sample_forecasts %>% 
-  select(date, predicted_sp500_return = model1_predicted_return)
+cat("\n=== RUNNING BACKTESTS ===\n\n")
 
-predictions_model2 <- sample_forecasts %>% 
-  select(date, predicted_sp500_return = model2_predicted_return)
+# Prepare data for tactical_strategy_backtest function
+# The function expects: predicted_sp500_return, actual_sp500_return, tbill_quarterly_return
 
-predictions_model3 <- sample_forecasts %>% 
-  select(date, predicted_sp500_return = model3_predicted_return)
+actual_returns <- backtest_data %>%
+  select(date, actual_sp500_return = log_ret)
 
-# Run tactical strategy for each model
-cat("\n" , rep("=", 80), "\n")
-cat("MODEL 1: Optimistic Forecaster\n")
-strategy1 <- tactical_strategy_backtest(
-  predictions = predictions_model1,
+tbill_returns <- backtest_data %>%
+  select(date, tbill_quarterly_return)
+
+# Backtest 1: Random Forest Strategy
+cat("1. Random Forest Tactical Strategy\n")
+predictions_rf <- backtest_data %>% 
+  select(date, predicted_sp500_return = rf_forecast_ret)
+
+backtest_rf <- tactical_strategy_backtest(
+  predictions = predictions_rf,
   actual_returns = actual_returns,
-  tbill_returns = tbill_quarterly,
+  tbill_returns = tbill_returns,
   start_date = START_DATE,
   end_date = END_DATE,
   initial_capital = INITIAL_CAPITAL,
   transaction_cost = TRANSACTION_COST
 )
 
-cat("\n" , rep("=", 80), "\n")
-cat("MODEL 2: Conservative Forecaster\n")
-strategy2 <- tactical_strategy_backtest(
-  predictions = predictions_model2,
+# Backtest 2: XGBoost Strategy
+cat("\n2. XGBoost Tactical Strategy\n")
+predictions_xgb <- backtest_data %>% 
+  select(date, predicted_sp500_return = xgb_forecast_ret)
+
+backtest_xgb <- tactical_strategy_backtest(
+  predictions = predictions_xgb,
   actual_returns = actual_returns,
-  tbill_returns = tbill_quarterly,
+  tbill_returns = tbill_returns,
   start_date = START_DATE,
   end_date = END_DATE,
   initial_capital = INITIAL_CAPITAL,
   transaction_cost = TRANSACTION_COST
 )
 
-cat("\n" , rep("=", 80), "\n")
-cat("MODEL 3: Prevailing Mean\n")
-strategy3 <- tactical_strategy_backtest(
-  predictions = predictions_model3,
+# Backtest 3: Buy-and-Hold Benchmarks
+cat("\n3. Buy-and-Hold S&P 500 Benchmark\n")
+benchmark_sp500 <- buy_hold_sp500(
   actual_returns = actual_returns,
-  tbill_returns = tbill_quarterly,
+  start_date = START_DATE,
+  end_date = END_DATE,
+  initial_capital = INITIAL_CAPITAL
+)
+
+cat("\n4. Buy-and-Hold T-Bill Benchmark\n")
+benchmark_tbill <- buy_hold_tbill(
+  tbill_returns = tbill_returns,
+  start_date = START_DATE,
+  end_date = END_DATE,
+  initial_capital = INITIAL_CAPITAL
+)
+
+cat("\n5. Perfect Foresight Benchmark (Oracle)\n")
+cat("Note: This uses actual realized returns as predictions\n")
+cat("      It represents the theoretical maximum tactical strategy performance\n")
+predictions_all_right <- backtest_data %>% 
+  select(date, predicted_sp500_return = log_ret)
+
+benchmark_all_right <- tactical_strategy_backtest(
+  predictions = predictions_all_right,
+  actual_returns = actual_returns,
+  tbill_returns = tbill_returns,
   start_date = START_DATE,
   end_date = END_DATE,
   initial_capital = INITIAL_CAPITAL,
   transaction_cost = TRANSACTION_COST
 )
+cat("\n=== BACKTESTS COMPLETED ===\n")
+```
+
+---
+
+# 4. Performance Comparison
+
+## 4.1 Summary Table
+```{r performance-table}
 
 # Run benchmarks
 cat("\n" , rep("=", 80), "\n")
@@ -471,77 +499,77 @@ benchmark_tbill <- buy_hold_tbill(
 
 ---
 
-# 5. Performance Comparison
+# 4. Performance Comparison
 
-## 5.1 Summary Table
+## 4.1 Summary Table
 ```{r performance-table}
 # Create performance comparison table
 performance_table <- data.frame(
-  Strategy = c("Model 1 (Optimistic)", "Model 2 (Conservative)", 
-               "Model 3 (Prevailing)", "Buy-Hold S&P500", "Buy-Hold T-Bill"),
+  Strategy = c("Random Forest Tactical", "XGBoost Tactical", 
+               "Buy-Hold S&P500", "Buy-Hold T-Bill", "Perfect Foresight (Oracle)"),
   
   Total_Return = percent(c(
-    strategy1$metrics$total_return,
-    strategy2$metrics$total_return,
-    strategy3$metrics$total_return,
+    backtest_rf$metrics$total_return,
+    backtest_xgb$metrics$total_return,
     benchmark_sp500$metrics$total_return,
-    benchmark_tbill$metrics$total_return
+    benchmark_tbill$metrics$total_return,
+    benchmark_all_right$metrics$total_return
   ), accuracy = 0.01),
   
   Annualized_Return = percent(c(
-    strategy1$metrics$annualized_return,
-    strategy2$metrics$annualized_return,
-    strategy3$metrics$annualized_return,
+    backtest_rf$metrics$annualized_return,
+    backtest_xgb$metrics$annualized_return,
     benchmark_sp500$metrics$annualized_return,
-    benchmark_tbill$metrics$annualized_return
+    benchmark_tbill$metrics$annualized_return,
+    benchmark_all_right$metrics$annualized_return
   ), accuracy = 0.01),
   
   Sharpe_Ratio = c(
-    round(strategy1$metrics$sharpe_ratio, 3),
-    round(strategy2$metrics$sharpe_ratio, 3),
-    round(strategy3$metrics$sharpe_ratio, 3),
-    NA,
-    NA
+    round(backtest_rf$metrics$sharpe_ratio, 3),
+    round(backtest_xgb$metrics$sharpe_ratio, 3),
+    NA,  # Buy-Hold S&P500
+    NA,  # Buy-Hold T-Bill
+    round(benchmark_all_right$metrics$sharpe_ratio, 3)
   ),
   
   Max_Drawdown = percent(c(
-    strategy1$metrics$max_drawdown,
-    strategy2$metrics$max_drawdown,
-    strategy3$metrics$max_drawdown,
-    NA,
-    NA
+    backtest_rf$metrics$max_drawdown,
+    backtest_xgb$metrics$max_drawdown,
+    NA,  # Buy-Hold S&P500
+    NA,  # Buy-Hold T-Bill
+    benchmark_all_right$metrics$max_drawdown
   ), accuracy = 0.01),
   
   Win_Rate = percent(c(
-    strategy1$metrics$win_rate,
-    strategy2$metrics$win_rate,
-    strategy3$metrics$win_rate,
-    NA,
-    NA
+    backtest_rf$metrics$win_rate,
+    backtest_xgb$metrics$win_rate,
+    NA,  # Buy-Hold S&P500
+    NA,  # Buy-Hold T-Bill
+    benchmark_all_right$metrics$win_rate
   ), accuracy = 0.01),
   
   Turnover = percent(c(
-    strategy1$metrics$turnover,
-    strategy2$metrics$turnover,
-    strategy3$metrics$turnover,
-    NA,
-    NA
+    backtest_rf$metrics$turnover,
+    backtest_xgb$metrics$turnover,
+    NA,  # Buy-Hold S&P500
+    NA,  # Buy-Hold T-Bill
+    benchmark_all_right$metrics$turnover
   ), accuracy = 0.01),
   
   N_Switches = c(
-    strategy1$metrics$n_switches,
-    strategy2$metrics$n_switches,
-    strategy3$metrics$n_switches,
-    0,
-    0
+    backtest_rf$metrics$n_switches,
+    backtest_xgb$metrics$n_switches,
+    0,  # Buy-Hold S&P500
+    0,  # Buy-Hold T-Bill
+    benchmark_all_right$metrics$n_switches
   ),
   
   Final_Value = round(c(
-    strategy1$metrics$final_value,
-    strategy2$metrics$final_value,
-    strategy3$metrics$final_value,
+    backtest_rf$metrics$final_value,
+    backtest_xgb$metrics$final_value,
     benchmark_sp500$metrics$final_value,
-    benchmark_tbill$metrics$final_value
+    benchmark_tbill$metrics$final_value,
+    benchmark_all_right$metrics$final_value
   ), 4)
 )
 
@@ -557,19 +585,24 @@ kable(performance_table, align = "lrrrrrrrr",
 ## 6.1 Portfolio Value Over Time
 ```{r portfolio-plot, fig.width=12, fig.height=6}
 # Combine all portfolio values
+## 4.2 Portfolio Value Comparison
+
+# Combine all portfolio value trajectories
 portfolio_comparison <- bind_rows(
-  strategy1$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Model 1"),
-  strategy2$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Model 2"),
-  strategy3$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Model 3"),
-  benchmark_sp500$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Buy-Hold SP500"),
+  backtest_rf$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Random Forest Tactical"),
+  backtest_xgb$results %>% select(date, portfolio_value) %>% mutate(Strategy = "XGBoost Tactical"),
+  benchmark_sp500$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Buy-Hold S&P 500"),
+  benchmark_all_right$results %>% select(date, portfolio_value) %>% mutate(Strategy = "all_righht"),
   benchmark_tbill$results %>% select(date, portfolio_value) %>% mutate(Strategy = "Buy-Hold T-Bill")
 )
 
 ggplot(portfolio_comparison, aes(x = date, y = portfolio_value, color = Strategy)) +
   geom_line(linewidth = 1) +
   scale_y_log10(labels = dollar_format()) +
-  scale_color_manual(values = c("Model 1" = "red", "Model 2" = "blue", 
-                                 "Model 3" = "darkgreen", "Buy-Hold SP500" = "black",
+  scale_color_manual(values = c("Random Forest Tactical" = "red", 
+                                "all_righht"="green",
+                                 "XGBoost Tactical" = "blue", 
+                                 "Buy-Hold S&P 500" = "black",
                                  "Buy-Hold T-Bill" = "gray50")) +
   labs(
     title = "Portfolio Value Comparison: Tactical Strategies vs Benchmarks",
@@ -585,20 +618,20 @@ ggplot(portfolio_comparison, aes(x = date, y = portfolio_value, color = Strategy
   )
 ```
 
-## 6.2 Asset Allocation Over Time (Model 1 Example)
-```{r allocation-plot, fig.width=12, fig.height=6}
-# Show position switches for Model 1
-position_data <- strategy1$results %>%
+## 4.3 Random Forest Asset Allocation Over Time
+```{r allocation-rf, fig.width=12, fig.height=6}
+# Show position switches for Random Forest
+position_data_rf <- backtest_rf$results %>%
   filter(!is.na(position)) %>%
   mutate(position_numeric = ifelse(position == "SP500", 1, 0))
 
-ggplot(position_data, aes(x = date, y = position_numeric)) +
+ggplot(position_data_rf, aes(x = date, y = position_numeric)) +
   geom_step(color = "steelblue", linewidth = 1) +
   scale_y_continuous(breaks = c(0, 1), labels = c("T-Bill", "S&P 500")) +
   labs(
-    title = "Model 1: Asset Allocation Over Time",
-    subtitle = paste("Switches:", strategy1$metrics$n_switches, 
-                     "| Turnover:", percent(strategy1$metrics$turnover, accuracy = 0.1)),
+    title = "Random Forest: Asset Allocation Over Time",
+    subtitle = paste("Switches:", backtest_rf$metrics$n_switches, 
+                     "| Turnover:", percent(backtest_rf$metrics$turnover, accuracy = 0.1)),
     x = "Date",
     y = "Position"
   ) +
@@ -609,23 +642,44 @@ ggplot(position_data, aes(x = date, y = position_numeric)) +
   )
 ```
 
-## 6.3 Return Distribution
+## 4.4 XGBoost Asset Allocation Over Time
+```{r allocation-xgb, fig.width=12, fig.height=6}
+# Show position switches for XGBoost
+position_data_xgb <- backtest_xgb$results %>%
+  filter(!is.na(position)) %>%
+  mutate(position_numeric = ifelse(position == "SP500", 1, 0))
+
+ggplot(position_data_xgb, aes(x = date, y = position_numeric)) +
+  geom_step(color = "darkgreen", linewidth = 1) +
+  scale_y_continuous(breaks = c(0, 1), labels = c("T-Bill", "S&P 500")) +
+  labs(
+    title = "XGBoost: Asset Allocation Over Time",
+    subtitle = paste("Switches:", backtest_xgb$metrics$n_switches, 
+                     "| Turnover:", percent(backtest_xgb$metrics$turnover, accuracy = 0.1)),
+    x = "Date",
+    y = "Position"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+## 4.5 Return Distribution
 ```{r return-dist, fig.width=10, fig.height=6}
 # Compare return distributions
 return_comparison <- bind_rows(
-  strategy1$results %>% filter(!is.na(returns_earned)) %>% 
-    select(date, returns_earned) %>% mutate(Strategy = "Model 1"),
-  strategy2$results %>% filter(!is.na(returns_earned)) %>% 
-    select(date, returns_earned) %>% mutate(Strategy = "Model 2"),
-  strategy3$results %>% filter(!is.na(returns_earned)) %>% 
-    select(date, returns_earned) %>% mutate(Strategy = "Model 3")
+  backtest_rf$results %>% filter(!is.na(returns_earned)) %>% 
+    select(date, returns_earned) %>% mutate(Strategy = "Random Forest"),
+  backtest_xgb$results %>% filter(!is.na(returns_earned)) %>% 
+    select(date, returns_earned) %>% mutate(Strategy = "XGBoost")
 )
 
 ggplot(return_comparison, aes(x = returns_earned, fill = Strategy)) +
   geom_histogram(alpha = 0.6, bins = 30, position = "identity") +
   facet_wrap(~Strategy, ncol = 1) +
-  scale_fill_manual(values = c("Model 1" = "red", "Model 2" = "blue", 
-                                "Model 3" = "darkgreen")) +
+  scale_fill_manual(values = c("Random Forest" = "red", "XGBoost" = "blue")) +
   labs(
     title = "Quarterly Return Distribution by Strategy",
     x = "Quarterly Return",
