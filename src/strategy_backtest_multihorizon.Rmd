@@ -67,7 +67,8 @@ cat("  - Random Forest (rf)\n")
 cat("  - Lasso\n")
 cat("  - Ridge\n")
 cat("  - PCR\n")
-cat("  - Elastic Net\n\n")
+cat("  - Elastic Net\n")
+cat("  - Ensemble (Equal-Weight)\n\n")
 
 cat("Available horizons:\n")
 cat("  - 3-month (quarterly)\n")
@@ -77,7 +78,23 @@ cat("  - 12-month (annual)\n\n")
 head(forecast_data, 5)
 ```
 
-## 1.2 Load T-Bill Returns
+## 1.2 Load Ensemble Forecasts
+
+```{r load-ensemble}
+cat("\n=== LOADING ENSEMBLE EQUAL-WEIGHT FORECASTS ===\n\n")
+
+# Load ensemble forecasts
+ensemble_data <- read_csv("../data/ensemble_equal_weight_forecasts.csv")
+
+cat("✓ Ensemble forecasts loaded:", nrow(ensemble_data), "observations\n")
+cat("  Date range:", min(ensemble_data$date), "to", max(ensemble_data$date), "\n")
+cat("  Ensemble method: Equal-weight average of Ridge, RF, and PCR\n")
+cat("  Weights: 33.33% each\n\n")
+
+head(ensemble_data, 5)
+```
+
+## 1.3 Load T-Bill Returns
 
 ```{r load-tbills}
 cat("\n=== LOADING T-BILL RETURNS ===\n\n")
@@ -96,12 +113,16 @@ cat("  - tbill_return_12m: 12-month holding period return\n\n")
 head(tbill_data, 5)
 ```
 
-## 1.3 Merge Forecasts with T-Bills
+## 1.4 Merge Forecasts with T-Bills
 
 ```{r merge-data}
 cat("\n=== MERGING FORECAST AND T-BILL DATA ===\n\n")
 
-# Merge forecasts with T-bills
+# Merge forecasts with ensemble forecasts
+forecast_data <- forecast_data %>%
+  left_join(ensemble_data %>% select(date, starts_with("ensemble_")), by = "date")
+
+# Merge with T-bills
 backtest_data <- forecast_data %>%
   inner_join(tbill_data, by = "date") %>%
   arrange(date) %>%
@@ -115,6 +136,7 @@ cat("  Total columns:", ncol(backtest_data), "\n\n")
 cat("Dataset structure:\n")
 cat("  - Actual returns: actual_3m, actual_6m, actual_12m\n")
 cat("  - Model forecasts: [model]_forecast_[horizon]\n")
+cat("  - Ensemble forecasts: ensemble_forecast_3m, ensemble_forecast_6m, ensemble_forecast_12m\n")
 cat("  - T-Bill returns: tbill_return_3m, tbill_return_6m, tbill_return_12m\n\n")
 
 # Show summary
@@ -174,50 +196,70 @@ tactical_backtest <- function(data, forecast_col, actual_col, tbill_col, horizon
   cat("  Date range:", min(decision_df$date), "to", max(decision_df$date), "\n")
   
   # For each rebalancing decision, we hold for rebal_freq quarters
-  # and compound the quarterly returns over that holding period
-  portfolio_value <- numeric(n_rebalances + 1)
-  position <- character(n_rebalances + 1)
-  period_returns <- numeric(n_rebalances)
+  # We need to track which asset we hold and compound quarterly returns accordingly
   
-  # Starting values
-  portfolio_value[1] <- initial_capital
+  # Initialize position tracking
+  position <- character(n_rebalances + 1)
   position[1] <- NA
   
-  # Run strategy
+  # Build a quarter-by-quarter allocation series
+  n_quarters <- nrow(full_data)
+  quarterly_position <- character(n_quarters)
+  quarterly_returns <- numeric(n_quarters)
+  
+  # Fill in positions for each quarter based on rebalancing decisions
   for (t in 1:n_rebalances) {
-    # Decision at rebalancing date: Compare forecast with T-bill at decision point
     decision_date_idx <- decision_rows[t]
     
+    # Determine position for this rebalancing period
     if (decision_df$forecast[t] >= decision_df$tbill[t]) {
-      # Invest in S&P 500 - compound quarterly returns over holding period
       position[t + 1] <- "SP500"
-      
-      # Get the next rebal_freq quarterly returns
-      holding_period_idx <- decision_date_idx:(min(decision_date_idx + rebal_freq - 1, nrow(full_data)))
-      holding_returns <- full_data$actual[holding_period_idx]
-      
-      # Compound returns over holding period
-      period_returns[t] <- prod(1 + holding_returns) - 1
-      
+      current_position <- "SP500"
     } else {
-      # Invest in T-bills - compound quarterly T-bill returns over holding period
       position[t + 1] <- "TBILL"
-      
-      # Get the next rebal_freq quarterly T-bill returns
-      holding_period_idx <- decision_date_idx:(min(decision_date_idx + rebal_freq - 1, nrow(full_data)))
-      holding_returns <- full_data$tbill[holding_period_idx]
-      
-      # Compound returns over holding period
-      period_returns[t] <- prod(1 + holding_returns) - 1
+      current_position <- "TBILL"
     }
     
-    # Update portfolio value
-    portfolio_value[t + 1] <- portfolio_value[t] * (1 + period_returns[t])
+    # Apply this position to the next rebal_freq quarters
+    end_idx <- min(decision_date_idx + rebal_freq - 1, n_quarters)
+    quarterly_position[decision_date_idx:end_idx] <- current_position
+    
+    # Record which returns to use for each quarter
+    if (current_position == "SP500") {
+      quarterly_returns[decision_date_idx:end_idx] <- full_data$actual[decision_date_idx:end_idx]
+    } else {
+      quarterly_returns[decision_date_idx:end_idx] <- full_data$tbill[decision_date_idx:end_idx]
+    }
+  }
+  
+  # Now compound quarterly returns just like buy-and-hold
+  portfolio_value_quarterly <- initial_capital * cumprod(1 + quarterly_returns)
+  portfolio_value_quarterly <- c(initial_capital, portfolio_value_quarterly)
+  
+  # Extract values at rebalancing dates for reporting
+  # For each decision, we want the value AFTER holding for rebal_freq quarters
+  # decision_rows[i] is the quarter where we make decision
+  # We hold through quarters [decision_rows[i], decision_rows[i] + rebal_freq - 1]
+  # So we want portfolio value after quarter [decision_rows[i] + rebal_freq - 1]
+  # In portfolio_value_quarterly, that's index [decision_rows[i] + rebal_freq]
+  portfolio_value <- portfolio_value_quarterly[c(1, pmin(decision_rows + rebal_freq, length(portfolio_value_quarterly)))]
+  
+  # Calculate period returns for metrics (between rebalancing dates)
+  period_returns <- numeric(n_rebalances)
+  for (t in 1:n_rebalances) {
+    if (t == 1) {
+      period_returns[t] <- (portfolio_value[t + 1] / portfolio_value[1]) - 1
+    } else {
+      period_returns[t] <- (portfolio_value[t + 1] / portfolio_value[t]) - 1
+    }
   }
   
   # Create results dataframe
+  # Start date is one quarter before first decision date
+  start_date <- decision_df$date[1] %m-% months(3)
+  
   results_df <- data.frame(
-    date = c(decision_df$date[1], decision_df$date),
+    date = c(start_date, decision_df$date),
     portfolio_value = portfolio_value,
     position = position,
     returns_earned = c(NA, period_returns),
@@ -315,18 +357,21 @@ buy_hold_benchmark <- function(data, actual_col = NULL, tbill_col = NULL,
   cat("  Periods:", n_periods, "\n")
   cat("  Date range:", min(backtest_df$date), "to", max(backtest_df$date), "\n")
   
-  # Calculate cumulative returns - simple addition (not compounding)
-  cumulative_returns <- c(0, cumsum(backtest_df$actual))
-  portfolio_value <- initial_capital + cumulative_returns
+  # Calculate cumulative returns - compound returns over time
+  # This is correct: each period's return applies to the current portfolio value
+  portfolio_value <- c(initial_capital, initial_capital * cumprod(1 + backtest_df$actual))
+  
+  # Start date is one quarter before first return date
+  start_date <- backtest_df$date[1] %m-% months(3)
   
   results_df <- data.frame(
-    date = c(backtest_df$date[1], backtest_df$date),
+    date = c(start_date, backtest_df$date),
     portfolio_value = portfolio_value,
     position = asset
   )
   
   # Calculate metrics
-  total_return <- sum(backtest_df$actual)
+  total_return <- (portfolio_value[n_periods + 1] / portfolio_value[1]) - 1
   
   # Annualization factor - determine from column name
   col_name <- if (asset == "TBILL") tbill_col else actual_col
@@ -396,7 +441,7 @@ cat("\n")
 cat("QUARTERLY (3-MONTH) REBALANCING STRATEGIES\n")
 
 # Models to test
-models_3m <- c("rf", "lasso", "ridge", "pcr", "elastic")
+models_3m <- c("rf", "lasso", "ridge", "pcr", "elastic", "ensemble")
 
 # Initialize results list
 results_3m <- list()
@@ -451,7 +496,7 @@ cat("\n")
 cat("SEMI-ANNUAL (6-MONTH) REBALANCING STRATEGIES\n")
 
 # Models to test
-models_6m <- c("rf", "lasso", "ridge", "pcr", "elastic")
+models_6m <- c("rf", "lasso", "ridge", "pcr", "elastic", "ensemble")
 
 # Initialize results list
 results_6m <- list()
@@ -507,7 +552,7 @@ cat("\n")
 cat("ANNUAL (12-MONTH) REBALANCING STRATEGIES\n")
 
 # Models to test
-models_12m <- c("rf", "lasso", "ridge", "pcr", "elastic")
+models_12m <- c("rf", "lasso", "ridge", "pcr", "elastic", "ensemble")
 
 # Initialize results list
 results_12m <- list()
@@ -660,18 +705,30 @@ portfolio_3m <- bind_rows(lapply(names(results_3m), function(name) {
 }))
 
 # Create plot
-ggplot(portfolio_3m, aes(x = date, y = portfolio_value, color = Strategy)) +
+ggplot(portfolio_3m, aes(x = date, y = portfolio_value, color = Strategy, linetype = Strategy)) +
   geom_line(linewidth = 1.2) +
   scale_y_log10(labels = dollar_format()) +
   scale_color_manual(values = c(
-    "RF TACTICAL (3M)" = "#E41A1C",
-    "LASSO TACTICAL (3M)" = "#377EB8",
-    "RIDGE TACTICAL (3M)" = "#4DAF4A",
-    "PCR TACTICAL (3M)" = "#984EA3",
-    "ELASTIC TACTICAL (3M)" = "#FF7F00",
+    "RF Tactical (3M)" = "#E41A1C",
+    "LASSO Tactical (3M)" = "#377EB8",
+    "RIDGE Tactical (3M)" = "#4DAF4A",
+    "PCR Tactical (3M)" = "#984EA3",
+    "ELASTIC Tactical (3M)" = "#FF7F00",
+    "ENSEMBLE Tactical (3M)" = "#A65628",
     "Buy-Hold S&P500 (3M)" = "black",
     "Buy-Hold T-Bill (3M)" = "gray50",
     "Perfect Foresight (3M)" = "gold"
+  )) +
+  scale_linetype_manual(values = c(
+    "RF Tactical (3M)" = "solid",
+    "LASSO Tactical (3M)" = "solid",
+    "RIDGE Tactical (3M)" = "solid",
+    "PCR Tactical (3M)" = "solid",
+    "ELASTIC Tactical (3M)" = "solid",
+    "ENSEMBLE Tactical (3M)" = "solid",
+    "Buy-Hold S&P500 (3M)" = "solid",
+    "Buy-Hold T-Bill (3M)" = "dashed",
+    "Perfect Foresight (3M)" = "dotted"
   )) +
   labs(
     title = "Portfolio Value Evolution - Quarterly Rebalancing (3-Month Horizon)",
@@ -686,7 +743,7 @@ ggplot(portfolio_3m, aes(x = date, y = portfolio_value, color = Strategy)) +
     plot.title = element_text(face = "bold", size = 14),
     legend.text = element_text(size = 9)
   ) +
-  guides(color = guide_legend(nrow = 3))
+  guides(color = guide_legend(nrow = 3), linetype = guide_legend(nrow = 3))
 ```
 
 ## 7.2 Portfolio Value Evolution - Semi-Annual (6M)
@@ -700,18 +757,30 @@ portfolio_6m <- bind_rows(lapply(names(results_6m), function(name) {
 }))
 
 # Create plot
-ggplot(portfolio_6m, aes(x = date, y = portfolio_value, color = Strategy)) +
+ggplot(portfolio_6m, aes(x = date, y = portfolio_value, color = Strategy, linetype = Strategy)) +
   geom_line(linewidth = 1.2) +
   scale_y_log10(labels = dollar_format()) +
   scale_color_manual(values = c(
-    "RF TACTICAL (6M)" = "#E41A1C",
-    "LASSO TACTICAL (6M)" = "#377EB8",
-    "RIDGE TACTICAL (6M)" = "#4DAF4A",
-    "PCR TACTICAL (6M)" = "#984EA3",
-    "ELASTIC TACTICAL (6M)" = "#FF7F00",
+    "RF Tactical (6M)" = "#E41A1C",
+    "LASSO Tactical (6M)" = "#377EB8",
+    "RIDGE Tactical (6M)" = "#4DAF4A",
+    "PCR Tactical (6M)" = "#984EA3",
+    "ELASTIC Tactical (6M)" = "#FF7F00",
+    "ENSEMBLE Tactical (6M)" = "#A65628",
     "Buy-Hold S&P500 (6M)" = "black",
     "Buy-Hold T-Bill (6M)" = "gray50",
     "Perfect Foresight (6M)" = "gold"
+  )) +
+  scale_linetype_manual(values = c(
+    "RF Tactical (6M)" = "solid",
+    "LASSO Tactical (6M)" = "solid",
+    "RIDGE Tactical (6M)" = "solid",
+    "PCR Tactical (6M)" = "solid",
+    "ELASTIC Tactical (6M)" = "solid",
+    "ENSEMBLE Tactical (6M)" = "solid",
+    "Buy-Hold S&P500 (6M)" = "solid",
+    "Buy-Hold T-Bill (6M)" = "dashed",
+    "Perfect Foresight (6M)" = "dotted"
   )) +
   labs(
     title = "Portfolio Value Evolution - Semi-Annual Rebalancing (6-Month Horizon)",
@@ -726,7 +795,7 @@ ggplot(portfolio_6m, aes(x = date, y = portfolio_value, color = Strategy)) +
     plot.title = element_text(face = "bold", size = 14),
     legend.text = element_text(size = 9)
   ) +
-  guides(color = guide_legend(nrow = 3))
+  guides(color = guide_legend(nrow = 3), linetype = guide_legend(nrow = 3))
 ```
 
 ## 7.3 Portfolio Value Evolution - Annual (12M)
@@ -740,18 +809,30 @@ portfolio_12m <- bind_rows(lapply(names(results_12m), function(name) {
 }))
 
 # Create plot
-ggplot(portfolio_12m, aes(x = date, y = portfolio_value, color = Strategy)) +
+ggplot(portfolio_12m, aes(x = date, y = portfolio_value, color = Strategy, linetype = Strategy)) +
   geom_line(linewidth = 1.2) +
   scale_y_log10(labels = dollar_format()) +
   scale_color_manual(values = c(
-    "RF TACTICAL (12M)" = "#E41A1C",
-    "LASSO TACTICAL (12M)" = "#377EB8",
-    "RIDGE TACTICAL (12M)" = "#4DAF4A",
-    "PCR TACTICAL (12M)" = "#984EA3",
-    "ELASTIC TACTICAL (12M)" = "#FF7F00",
+    "RF Tactical (12M)" = "#E41A1C",
+    "LASSO Tactical (12M)" = "#377EB8",
+    "RIDGE Tactical (12M)" = "#4DAF4A",
+    "PCR Tactical (12M)" = "#984EA3",
+    "ELASTIC Tactical (12M)" = "#FF7F00",
+    "ENSEMBLE Tactical (12M)" = "#A65628",
     "Buy-Hold S&P500 (12M)" = "black",
     "Buy-Hold T-Bill (12M)" = "gray50",
     "Perfect Foresight (12M)" = "gold"
+  )) +
+  scale_linetype_manual(values = c(
+    "RF Tactical (12M)" = "solid",
+    "LASSO Tactical (12M)" = "solid",
+    "RIDGE Tactical (12M)" = "solid",
+    "PCR Tactical (12M)" = "solid",
+    "ELASTIC Tactical (12M)" = "solid",
+    "ENSEMBLE Tactical (12M)" = "solid",
+    "Buy-Hold S&P500 (12M)" = "solid",
+    "Buy-Hold T-Bill (12M)" = "dashed",
+    "Perfect Foresight (12M)" = "dotted"
   )) +
   labs(
     title = "Portfolio Value Evolution - Annual Rebalancing (12-Month Horizon)",
@@ -766,14 +847,14 @@ ggplot(portfolio_12m, aes(x = date, y = portfolio_value, color = Strategy)) +
     plot.title = element_text(face = "bold", size = 14),
     legend.text = element_text(size = 9)
   ) +
-  guides(color = guide_legend(nrow = 3))
+  guides(color = guide_legend(nrow = 3), linetype = guide_legend(nrow = 3))
 ```
 
 ## 7.4 Asset Allocation - Random Forest Example
 
 ```{r plot-allocation, fig.height=10}
 # RF allocation for all horizons
-p1 <- results_3m[["RF TACTICAL (3M)"]]$results %>%
+p1 <- results_3m[["RF Tactical (3M)"]]$results %>%
   filter(!is.na(position)) %>%
   mutate(position_numeric = ifelse(position == "SP500", 1, 0)) %>%
   ggplot(aes(x = date, y = position_numeric)) +
@@ -786,7 +867,7 @@ p1 <- results_3m[["RF TACTICAL (3M)"]]$results %>%
   ) +
   theme_minimal()
 
-p2 <- results_6m[["RF TACTICAL (6M)"]]$results %>%
+p2 <- results_6m[["RF Tactical (6M)"]]$results %>%
   filter(!is.na(position)) %>%
   mutate(position_numeric = ifelse(position == "SP500", 1, 0)) %>%
   ggplot(aes(x = date, y = position_numeric)) +
@@ -799,7 +880,7 @@ p2 <- results_6m[["RF TACTICAL (6M)"]]$results %>%
   ) +
   theme_minimal()
 
-p3 <- results_12m[["RF TACTICAL (12M)"]]$results %>%
+p3 <- results_12m[["RF Tactical (12M)"]]$results %>%
   filter(!is.na(position)) %>%
   mutate(position_numeric = ifelse(position == "SP500", 1, 0)) %>%
   ggplot(aes(x = date, y = position_numeric)) +

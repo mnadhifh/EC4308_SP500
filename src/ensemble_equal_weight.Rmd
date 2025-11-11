@@ -1,0 +1,393 @@
+---
+title: "Equal-Weight Ensemble Model"
+author: "EC4308 - S&P 500 Forecasting Project"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Load libraries
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(knitr)
+library(scales)
+```
+
+# Equal-Weight Ensemble Overview
+
+## Methodology
+
+**Simple Equal-Weight Averaging:**
+- Combine forecasts from 3 selected models: **Ridge, Random Forest, PCR**
+- Each model gets equal weight: **33.33% each**
+- No optimization, no training required
+- Apply across all three horizons: 3-month, 6-month, 12-month
+
+**Formula:**
+```
+Ensemble Forecast = (Ridge + RF + PCR) / 3
+```
+
+**Why These Models?**
+- **Ridge**: Best linear regression model (regularization handles multicollinearity)
+- **Random Forest (RF)**: Non-linear tree-based ensemble
+- **PCR**: Principal components regression (dimensionality reduction)
+
+---
+
+# 1. Load Data
+
+```{r load-data}
+cat("\n=== LOADING CONSOLIDATED FORECASTS ===\n\n")
+
+# Load the consolidated multi-horizon forecasts
+forecasts <- read_csv("../data/consolidated_forecasts_multihorizon.csv")
+
+cat("✓ Data loaded:", nrow(forecasts), "observations\n")
+cat("  Date range:", min(forecasts$date), "to", max(forecasts$date), "\n")
+cat("  Total columns:", ncol(forecasts), "\n\n")
+
+cat("Available columns:\n")
+print(names(forecasts))
+
+cat("\n")
+```
+
+---
+
+# 2. Create Equal-Weight Ensemble Forecasts
+
+## 2.1 Three-Month (Quarterly) Horizon
+
+```{r ensemble-3m}
+cat("\n=== CREATING 3-MONTH ENSEMBLE ===\n\n")
+
+# Equal-weight average of Ridge, RF, and PCR for 3-month forecasts
+forecasts <- forecasts %>%
+  mutate(
+    ensemble_forecast_3m = (ridge_forecast_3m + rf_forecast_3m + pcr_forecast_3m) / 3
+  )
+
+cat("✓ 3-month ensemble created!\n")
+cat("  Formula: (Ridge + RF + PCR) / 3\n")
+cat("  Weights: Ridge=33.33%, RF=33.33%, PCR=33.33%\n\n")
+
+# Show sample
+cat("Sample 3-month forecasts:\n")
+sample_3m <- forecasts %>%
+  select(date, actual_3m, ridge_forecast_3m, rf_forecast_3m, 
+         pcr_forecast_3m, ensemble_forecast_3m) %>%
+  head(10)
+print(sample_3m)
+
+# Calculate performance metrics
+if (sum(!is.na(forecasts$actual_3m) & !is.na(forecasts$ensemble_forecast_3m)) > 0) {
+  test_3m <- forecasts %>%
+    filter(!is.na(actual_3m) & !is.na(ensemble_forecast_3m))
+  
+  mse_3m <- mean((test_3m$actual_3m - test_3m$ensemble_forecast_3m)^2)
+  rmse_3m <- sqrt(mse_3m)
+  mae_3m <- mean(abs(test_3m$actual_3m - test_3m$ensemble_forecast_3m))
+  
+  cat("\n3-Month Ensemble Performance:\n")
+  cat("  RMSE:", round(rmse_3m, 6), "\n")
+  cat("  MAE :", round(mae_3m, 6), "\n")
+}
+```
+
+## 2.2 Six-Month (Semi-Annual) Horizon
+
+```{r ensemble-6m}
+cat("\n=== CREATING 6-MONTH ENSEMBLE ===\n\n")
+
+# Equal-weight average of Ridge, RF, and PCR for 6-month forecasts
+forecasts <- forecasts %>%
+  mutate(
+    ensemble_forecast_6m = (ridge_forecast_6m + rf_forecast_6m + pcr_forecast_6m) / 3
+  )
+
+cat("✓ 6-month ensemble created!\n")
+cat("  Formula: (Ridge + RF + PCR) / 3\n")
+cat("  Weights: Ridge=33.33%, RF=33.33%, PCR=33.33%\n\n")
+
+# Show sample
+cat("Sample 6-month forecasts:\n")
+sample_6m <- forecasts %>%
+  select(date, actual_6m, ridge_forecast_6m, rf_forecast_6m, 
+         pcr_forecast_6m, ensemble_forecast_6m) %>%
+  head(10)
+print(sample_6m)
+
+# Calculate performance metrics
+if (sum(!is.na(forecasts$actual_6m) & !is.na(forecasts$ensemble_forecast_6m)) > 0) {
+  test_6m <- forecasts %>%
+    filter(!is.na(actual_6m) & !is.na(ensemble_forecast_6m))
+  
+  mse_6m <- mean((test_6m$actual_6m - test_6m$ensemble_forecast_6m)^2)
+  rmse_6m <- sqrt(mse_6m)
+  mae_6m <- mean(abs(test_6m$actual_6m - test_6m$ensemble_forecast_6m))
+  
+  cat("\n6-Month Ensemble Performance:\n")
+  cat("  RMSE:", round(rmse_6m, 6), "\n")
+  cat("  MAE :", round(mae_6m, 6), "\n")
+}
+```
+
+## 2.3 Twelve-Month (Annual) Horizon
+
+```{r ensemble-12m}
+cat("\n=== CREATING 12-MONTH ENSEMBLE ===\n\n")
+
+# Equal-weight average of Ridge, RF, and PCR for 12-month forecasts
+forecasts <- forecasts %>%
+  mutate(
+    ensemble_forecast_12m = (ridge_forecast_12m + rf_forecast_12m + pcr_forecast_12m) / 3
+  )
+
+cat("✓ 12-month ensemble created!\n")
+cat("  Formula: (Ridge + RF + PCR) / 3\n")
+cat("  Weights: Ridge=33.33%, RF=33.33%, PCR=33.33%\n\n")
+
+# Show sample
+cat("Sample 12-month forecasts:\n")
+sample_12m <- forecasts %>%
+  select(date, actual_12m, ridge_forecast_12m, rf_forecast_12m, 
+         pcr_forecast_12m, ensemble_forecast_12m) %>%
+  head(10)
+print(sample_12m)
+
+# Calculate performance metrics
+if (sum(!is.na(forecasts$actual_12m) & !is.na(forecasts$ensemble_forecast_12m)) > 0) {
+  test_12m <- forecasts %>%
+    filter(!is.na(actual_12m) & !is.na(ensemble_forecast_12m))
+  
+  mse_12m <- mean((test_12m$actual_12m - test_12m$ensemble_forecast_12m)^2)
+  rmse_12m <- sqrt(mse_12m)
+  mae_12m <- mean(abs(test_12m$actual_12m - test_12m$ensemble_forecast_12m))
+  
+  cat("\n12-Month Ensemble Performance:\n")
+  cat("  RMSE:", round(rmse_12m, 6), "\n")
+  cat("  MAE :", round(mae_12m, 6), "\n")
+}
+```
+
+---
+
+# 3. Visualize Ensemble Forecasts
+
+## 3.1 Three-Month Forecasts
+
+```{r plot-3m, fig.width=12, fig.height=6}
+# Plot 3-month forecasts
+forecasts %>%
+  select(date, actual_3m, ridge_forecast_3m, rf_forecast_3m, 
+         pcr_forecast_3m, ensemble_forecast_3m) %>%
+  pivot_longer(cols = c(ridge_forecast_3m, rf_forecast_3m, 
+                        pcr_forecast_3m, ensemble_forecast_3m),
+               names_to = "Model", values_to = "Forecast") %>%
+  mutate(Model = gsub("_forecast_3m", "", Model),
+         Model = recode(Model, 
+                       "ridge" = "Ridge",
+                       "rf" = "Random Forest",
+                       "pcr" = "PCR",
+                       "ensemble" = "Ensemble (Equal Weight)")) %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = actual_3m), color = "black", linewidth = 1, alpha = 0.5) +
+  geom_line(aes(y = Forecast, color = Model), linewidth = 0.8) +
+  scale_color_manual(values = c(
+    "Ridge" = "#4DAF4A",
+    "Random Forest" = "#E41A1C",
+    "PCR" = "#984EA3",
+    "Ensemble (Equal Weight)" = "#FF7F00"
+  )) +
+  labs(
+    title = "3-Month Forecasts: Individual Models vs Equal-Weight Ensemble",
+    subtitle = "Black line = Actual returns",
+    x = "Date",
+    y = "Return",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  )
+```
+
+## 3.2 Six-Month Forecasts
+
+```{r plot-6m, fig.width=12, fig.height=6}
+# Plot 6-month forecasts
+forecasts %>%
+  select(date, actual_6m, ridge_forecast_6m, rf_forecast_6m, 
+         pcr_forecast_6m, ensemble_forecast_6m) %>%
+  pivot_longer(cols = c(ridge_forecast_6m, rf_forecast_6m, 
+                        pcr_forecast_6m, ensemble_forecast_6m),
+               names_to = "Model", values_to = "Forecast") %>%
+  mutate(Model = gsub("_forecast_6m", "", Model),
+         Model = recode(Model, 
+                       "ridge" = "Ridge",
+                       "rf" = "Random Forest",
+                       "pcr" = "PCR",
+                       "ensemble" = "Ensemble (Equal Weight)")) %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = actual_6m), color = "black", linewidth = 1, alpha = 0.5) +
+  geom_line(aes(y = Forecast, color = Model), linewidth = 0.8) +
+  scale_color_manual(values = c(
+    "Ridge" = "#4DAF4A",
+    "Random Forest" = "#E41A1C",
+    "PCR" = "#984EA3",
+    "Ensemble (Equal Weight)" = "#FF7F00"
+  )) +
+  labs(
+    title = "6-Month Forecasts: Individual Models vs Equal-Weight Ensemble",
+    subtitle = "Black line = Actual returns",
+    x = "Date",
+    y = "Return",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  )
+```
+
+## 3.3 Twelve-Month Forecasts
+
+```{r plot-12m, fig.width=12, fig.height=6}
+# Plot 12-month forecasts
+forecasts %>%
+  select(date, actual_12m, ridge_forecast_12m, rf_forecast_12m, 
+         pcr_forecast_12m, ensemble_forecast_12m) %>%
+  pivot_longer(cols = c(ridge_forecast_12m, rf_forecast_12m, 
+                        pcr_forecast_12m, ensemble_forecast_12m),
+               names_to = "Model", values_to = "Forecast") %>%
+  mutate(Model = gsub("_forecast_12m", "", Model),
+         Model = recode(Model, 
+                       "ridge" = "Ridge",
+                       "rf" = "Random Forest",
+                       "pcr" = "PCR",
+                       "ensemble" = "Ensemble (Equal Weight)")) %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = actual_12m), color = "black", linewidth = 1, alpha = 0.5) +
+  geom_line(aes(y = Forecast, color = Model), linewidth = 0.8) +
+  scale_color_manual(values = c(
+    "Ridge" = "#4DAF4A",
+    "Random Forest" = "#E41A1C",
+    "PCR" = "#984EA3",
+    "Ensemble (Equal Weight)" = "#FF7F00"
+  )) +
+  labs(
+    title = "12-Month Forecasts: Individual Models vs Equal-Weight Ensemble",
+    subtitle = "Black line = Actual returns",
+    x = "Date",
+    y = "Return",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  )
+```
+
+---
+
+# 4. Save Ensemble Forecasts
+
+```{r save-ensemble}
+cat("\n=== SAVING ENSEMBLE FORECASTS ===\n\n")
+
+# Create output with ensemble forecasts
+ensemble_output <- forecasts %>%
+  select(date, 
+         actual_3m, actual_6m, actual_12m,
+         ensemble_forecast_3m, ensemble_forecast_6m, ensemble_forecast_12m)
+
+# Save to CSV
+write_csv(ensemble_output, "../data/ensemble_equal_weight_forecasts.csv")
+
+cat("✓ Ensemble forecasts saved to: ../data/ensemble_equal_weight_forecasts.csv\n")
+cat("  Rows:", nrow(ensemble_output), "\n")
+cat("  Columns:", ncol(ensemble_output), "\n\n")
+
+cat("Columns saved:\n")
+cat("  - date\n")
+cat("  - actual_3m, actual_6m, actual_12m (actual returns)\n")
+cat("  - ensemble_forecast_3m (Ridge+RF+PCR average for 3M)\n")
+cat("  - ensemble_forecast_6m (Ridge+RF+PCR average for 6M)\n")
+cat("  - ensemble_forecast_12m (Ridge+RF+PCR average for 12M)\n\n")
+
+# Also update the main consolidated file with ensemble forecasts
+forecasts_with_ensemble <- forecasts %>%
+  select(date, 
+         actual_12m, actual_3m, actual_6m,
+         rf_forecast_12m, rf_forecast_3m, rf_forecast_6m,
+         lasso_forecast_3m, lasso_forecast_6m, lasso_forecast_12m,
+         ridge_forecast_3m, ridge_forecast_6m, ridge_forecast_12m,
+         pcr_forecast_3m, pcr_forecast_6m, pcr_forecast_12m,
+         elastic_forecast_3m, elastic_forecast_6m, elastic_forecast_12m,
+         ensemble_forecast_3m, ensemble_forecast_6m, ensemble_forecast_12m)
+
+write_csv(forecasts_with_ensemble, "../data/consolidated_forecasts_with_ensemble.csv")
+
+cat("✓ Updated consolidated file saved to: ../data/consolidated_forecasts_with_ensemble.csv\n")
+cat("  Now includes ensemble forecasts alongside all individual models!\n\n")
+```
+
+---
+
+# 5. Summary
+
+```{r summary}
+cat("\n=================================================\n")
+cat("      EQUAL-WEIGHT ENSEMBLE SUMMARY              \n")
+cat("=================================================\n\n")
+
+cat("METHODOLOGY:\n")
+cat("  - Type: Simple equal-weight average\n")
+cat("  - Models combined: Ridge, Random Forest, PCR\n")
+cat("  - Weights: 33.33% each (no optimization)\n")
+cat("  - Horizons: 3-month, 6-month, 12-month\n\n")
+
+cat("FORMULA:\n")
+cat("  Ensemble = (Ridge + RF + PCR) / 3\n\n")
+
+cat("RATIONALE:\n")
+cat("  - Ridge: Best linear model with regularization\n")
+cat("  - Random Forest: Non-linear tree-based ensemble\n")
+cat("  - PCR: Dimensionality reduction approach\n")
+cat("  - Diversification across model types\n\n")
+
+if (exists("rmse_3m")) {
+  cat("PERFORMANCE (where actual data available):\n")
+  if (exists("rmse_3m")) cat(sprintf("  3-Month:  RMSE=%.6f, MAE=%.6f\n", rmse_3m, mae_3m))
+  if (exists("rmse_6m")) cat(sprintf("  6-Month:  RMSE=%.6f, MAE=%.6f\n", rmse_6m, mae_6m))
+  if (exists("rmse_12m")) cat(sprintf("  12-Month: RMSE=%.6f, MAE=%.6f\n", rmse_12m, mae_12m))
+  cat("\n")
+}
+
+cat("OUTPUT FILES:\n")
+cat("  1. ensemble_equal_weight_forecasts.csv\n")
+cat("     - Date + actuals + ensemble forecasts only\n")
+cat("  2. consolidated_forecasts_with_ensemble.csv\n")
+cat("     - All models + ensemble forecasts combined\n\n")
+
+cat("=================================================\n")
+cat("Next step: Use these ensemble forecasts in\n")
+cat("           strategy_backtest_multihorizon.Rmd!\n")
+cat("=================================================\n")
+```
+
+---
+
+**End of Report**
