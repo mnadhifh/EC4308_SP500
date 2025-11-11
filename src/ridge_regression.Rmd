@@ -26,22 +26,108 @@ data_mean = read.csv("../data/prevail_mean.csv")
 data$date <- as.Date(data$date)
 data_mean$date <- as.Date(data_mean$date)
 
+# ============================================================================
+# CREATE MULTI-HORIZON TARGET VARIABLES
+# ============================================================================
+# We want to forecast 3-month, 6-month, and 12-month ahead returns
+# 6-month = sum of 2 consecutive quarters
+# 12-month = sum of 4 consecutive quarters
+
+data <- data %>%
+  arrange(date) %>%
+  mutate(
+    # Create lead log returns for each horizon
+    log_ret_lead_3m = lead(log_ret, 1),           # 3-month ahead (1 quarter)
+    log_ret_lead_6m = lead(log_ret, 1) + lead(log_ret, 2),  # 6-month ahead (2 quarters)
+    log_ret_lead_12m = lead(log_ret, 1) + lead(log_ret, 2) + lead(log_ret, 3) + lead(log_ret, 4)  # 12-month ahead (4 quarters)
+  )
+
+# ============================================================================
+# CREATE LAGGED VARIABLES FOR MULTI-HORIZON TARGETS
+# ============================================================================
+# Create 5 lags for each horizon's returns
+
+# Lags for 3-month returns
+data <- data %>%
+  mutate(
+    log_ret_3m_L1 = lag(log_ret_lead_3m, 1),
+    log_ret_3m_L2 = lag(log_ret_lead_3m, 2),
+    log_ret_3m_L3 = lag(log_ret_lead_3m, 3),
+    log_ret_3m_L4 = lag(log_ret_lead_3m, 4),
+    log_ret_3m_L5 = lag(log_ret_lead_3m, 5)
+  )
+
+# ============================================================================
+# SELECT FINAL FEATURES FOR MODELING
+# ============================================================================
+
 data <- data %>%
   select(
     date,
     log_ret,
-    matches("^price_fd_L[1-5]$"),
-    matches("^log_ret_L[1-5]$"),
-    matches("_L[2-5]$")       # only lagged features from at least 2 periods ago
-  ) %>%
-  left_join(
-    data_mean %>% select(date, mean_prevailing_ret),
-    by = "date"
+    # Multi-horizon targets
+    log_ret_lead_3m,
+    log_ret_lead_6m,
+    log_ret_lead_12m,
+    # All lagged y's for 3-month horizon
+    matches("^log_ret_3m_L"),
+    # ALL lagged x variables (L2-L5 only to avoid leakage with 1-quarter lead)
+    matches("_L[2-5]$")
   )
+
+cat("\n=== Multi-Horizon Target Variables Created ===\n")
+cat("✓ log_ret_lead_3m: 3-month ahead returns (1 quarter)\n")
+cat("✓ log_ret_lead_6m: 6-month ahead returns (sum of 2 quarters)\n")
+cat("✓ log_ret_lead_12m: 12-month ahead returns (sum of 4 quarters)\n")
+cat("✓ 5 lags created for each horizon\n")
+
+# ============================================================================
+# DIAGNOSTIC: Show all available columns with lag variables
+# ============================================================================
+
+cat("\n=== All Columns in Data ===\n")
+all_cols <- colnames(data)
+cat("Total columns:", length(all_cols), "\n")
+cat("Columns:", paste(all_cols, collapse = ", "), "\n")
+
+cat("\n=== Lag Columns (containing _L2, _L3, _L4, or _L5) ===\n")
+lag_cols <- grep("_L[2-5]$", all_cols, value = TRUE)
+cat("Total lag variables (L2-L5):", length(lag_cols), "\n")
+print(lag_cols)
+
+cat("\n=== 3-month Horizon Lag Columns ===\n")
+lag_3m <- grep("^log_ret_3m_L", all_cols, value = TRUE)
+cat("Total 3m lag variables:", length(lag_3m), "\n")
+print(lag_3m)
+
+cat("\n=== FEATURE SUMMARY ===\n")
+cat("log_ret_3m_L* (3m horizon lags):", length(lag_3m), "\n")
+cat("_L[2-5]$ (all L2-L5 variables):", length(lag_cols), "\n")
+cat("TOTAL FEATURES FOR MODELING:", length(lag_3m) + length(lag_cols), "\n")
 
 ```
 
-## Ridge Regression Model
+```{r}
+# ============================================================================
+# REMOVE NA VALUES (ONLY LAGGED AND LEAD VARIABLES)
+# ============================================================================
+
+cat("\n=== Removing NA Values ===\n")
+cat("Observations before drop_na():", nrow(data), "\n")
+
+# Remove all rows with any NA values
+data_clean <- data %>%
+  drop_na()
+
+cat("Observations after drop_na():", nrow(data_clean), "\n")
+cat("Rows removed:", nrow(data) - nrow(data_clean), "\n\n")
+
+# Show date range of clean data
+cat("Date range of clean dataset:\n")
+cat("  From:", as.character(min(data_clean$date)), "\n")
+cat("  To:  ", as.character(max(data_clean$date)), "\n")
+
+```
 
 # ============================================================================
 # MODELING APPROACH: 80/20 Train-Test Split w/ Recursive CV
@@ -50,10 +136,8 @@ data <- data %>%
 ```{r}
 # --- STEP 1: Prepare data ---
 
-ridge_df <- data %>%
-  arrange(date) %>%
-  select(-mean_prevailing_ret) %>%
-  drop_na()
+ridge_df <- data_clean %>%
+  arrange(date)
 
 set.seed(123)
 
@@ -62,20 +146,70 @@ train_size <- floor(0.8 * n)  # 80% training
 test_size <- n - train_size   # 20% testing
 
 cat("\n=== Data Split ===\n")
+cat("Total observations:", n, "\n")
 cat("Training:", train_size, "observations\n")
 cat("Testing :", test_size, "observations\n")
 
 train_data <- ridge_df[1:train_size, ]
 test_data  <- ridge_df[(train_size + 1):n, ]
 
-# Extract features and target
-X_train <- train_data %>% select(-date, -log_ret) %>% as.matrix()
-y_train <- train_data$log_ret
+# ============================================================================
+# PREPARE DATA FOR MULTI-HORIZON FORECASTING
+# ============================================================================
 
-X_test <- test_data %>% select(-date, -log_ret) %>% as.matrix()
-y_test <- test_data$log_ret
+cat("\n=== Multi-Horizon Models Setup ===\n")
 
-cat("\nFeatures in model:", ncol(X_train), "\n")
+# Define horizons
+horizons <- c("3m", "6m", "12m")
+
+# Get COMMON features used for ALL horizons
+# (only log_ret_3m_L1-L5 lag variables + all L2-L5 economic indicators)
+common_features <- ridge_df %>%
+  select(
+    matches("^log_ret_3m_L"),   # log_ret_3m_L1-L5
+    matches("_L[2-5]$")          # ALL L2-L5 variables (including log_ret_3m_L2-L5 which overlap)
+  ) %>%
+  names() %>%
+  unique()
+
+cat("\nCommon features for ALL horizons:\n")
+cat("  Total features:", length(common_features), "\n")
+cat("  Feature names:", paste(common_features, collapse = ", "), "\n")
+
+# For each horizon, prepare X and y with the SAME features
+for (horizon in horizons) {
+  
+  # Select the target variable for this horizon
+  target_col <- paste0("log_ret_lead_", horizon)
+  
+  # All three horizons use the SAME feature set
+  feature_cols <- common_features
+  
+  # Training set
+  X_train_temp <- train_data %>%
+    select(all_of(feature_cols)) %>%
+    as.matrix()
+  
+  y_train_temp <- train_data[[target_col]]
+  
+  # Test set
+  X_test_temp <- test_data %>%
+    select(all_of(feature_cols)) %>%
+    as.matrix()
+  
+  y_test_temp <- test_data[[target_col]]
+  
+  # Assign to environment with horizon-specific names
+  assign(paste0("X_train_", horizon), X_train_temp)
+  assign(paste0("y_train_", horizon), y_train_temp)
+  assign(paste0("X_test_", horizon), X_test_temp)
+  assign(paste0("y_test_", horizon), y_test_temp)
+  
+  cat("\nHorizon:", horizon, "\n")
+  cat("  Features:", ncol(X_train_temp), "\n")
+  cat("  Train observations:", nrow(X_train_temp), "\n")
+  cat("  Test observations:", nrow(X_test_temp), "\n")
+}
 
 ```
 
@@ -177,6 +311,289 @@ select_lambda_bic <- function(X, y, alpha = 0, lambdas = NULL) {
   }
   
   return(result)
+}
+
+```
+
+## Build Ridge Models for Each Horizon
+
+```{r}
+# ---- Fit Ridge Regression Models for Each Horizon (3m, 6m, 12m) ----
+# Each horizon gets its own independent BIC optimization
+
+# Lambda sequence for BIC optimization
+lambdas <- 10^seq(3, -1, length.out = 50)
+
+# Store results for each horizon
+ridge_results <- list()
+
+# Loop through each horizon
+for (horizon in c("3m", "6m", "12m")) {
+  cat("\n========== HORIZON:", horizon, "==========\n")
+  
+  # Extract datasets for this horizon (horizon-specific features only)
+  X_train_h <- get(paste0("X_train_", horizon))
+  y_train_h <- get(paste0("y_train_", horizon))
+  X_test_h <- get(paste0("X_test_", horizon))
+  y_test_h <- get(paste0("y_test_", horizon))
+  
+  cat("Features for", horizon, "horizon:", ncol(X_train_h), "variables\n")
+  cat("Sample features:", paste(colnames(X_train_h)[seq_len(min(3, ncol(X_train_h)))], collapse = ", "), "\n")
+  
+  # Fit ridge regression with BIC lambda selection
+  # BIC optimization is done INDEPENDENTLY for each horizon
+  ridge_fit <- select_lambda_bic(X_train_h, y_train_h, 
+                                 alpha = 0, 
+                                 lambdas = lambdas)
+  
+  # Store the result
+  ridge_results[[horizon]] <- ridge_fit
+  
+  # Extract optimal lambda and model
+  lambda_opt <- ridge_fit$lambda_best  # Note: lambda_best, not lambda_opt
+  fit_glmnet <- ridge_fit$fit
+  
+  cat("\nOptimal lambda (BIC) for", horizon, ":", lambda_opt, "\n")
+  cat("Top 10 BIC values:\n")
+  print(head(ridge_fit$bic_tbl, 10))
+  
+  # Make predictions on test set
+  y_pred_test <- as.vector(predict(fit_glmnet, newx = X_test_h, s = lambda_opt))
+  
+  # Make predictions on training set
+  y_pred_train <- as.vector(predict(fit_glmnet, newx = X_train_h, s = lambda_opt))
+  
+  # Compute test metrics (RMSE = sqrt(mean(squared errors)))
+  rmse_test <- sqrt(mean((y_test_h - y_pred_test)^2))
+  
+  # Compute training metrics
+  rmse_train <- sqrt(mean((y_train_h - y_pred_train)^2))
+  
+  # Display metrics
+  cat("\nTest Set Metrics:\n")
+  cat("  RMSE:", rmse_test, "\n")
+  
+  cat("\nTraining Set Metrics:\n")
+  cat("  RMSE:", rmse_train, "\n")
+  
+  # Extract coefficients
+  coefficients <- as.vector(coef(fit_glmnet, s = lambda_opt))
+  
+  # Create results dataframe for test predictions
+  test_results <- data.frame(
+    actual = y_test_h,
+    predicted = y_pred_test,
+    residual = y_test_h - y_pred_test,
+    abs_error = abs(y_test_h - y_pred_test)
+  )
+  
+  # Create results dataframe for training predictions
+  train_results <- data.frame(
+    actual = y_train_h,
+    predicted = y_pred_train,
+    residual = y_train_h - y_pred_train,
+    abs_error = abs(y_train_h - y_pred_train)
+  )
+  
+  # Create metrics summary
+  metrics_summary <- data.frame(
+    Horizon = horizon,
+    Dataset = c("Training", "Test"),
+    RMSE = c(rmse_train, rmse_test),
+    Lambda_Optimal = lambda_opt,
+    N_NonZero_Coefs = sum(coefficients[-1] != 0)  # Exclude intercept
+  )
+  
+  # Store results and metrics in lists for later visualization
+  ridge_results[[horizon]]$train_results <- train_results
+  ridge_results[[horizon]]$test_results <- test_results
+  ridge_results[[horizon]]$metrics_summary <- metrics_summary
+  ridge_results[[horizon]]$train_data_dates <- train_data$date
+  ridge_results[[horizon]]$test_data_dates <- test_data$date
+  
+  cat("\n")
+}
+
+cat("\n========== RIDGE REGRESSION MODELS COMPLETE ==========\n")
+
+# Create cross-horizon summary
+cat("\nCross-Horizon Summary:\n")
+summary_list <- lapply(c("3m", "6m", "12m"), function(horizon) {
+  ridge_results[[horizon]]$metrics_summary
+})
+summary_table <- do.call(rbind, summary_list)
+print(summary_table)
+
+```
+
+## Visualizations: Ridge Regression Results for Each Horizon
+
+```{r}
+# ---- Visualize Test Set: Forecasted vs Actual for Each Horizon ----
+
+for (horizon in c("3m", "6m", "12m")) {
+  
+  test_results <- ridge_results[[horizon]]$test_results
+  test_dates <- ridge_results[[horizon]]$test_data_dates
+  
+  # Add dates to results
+  test_results$date <- test_dates
+  
+  metrics <- ridge_results[[horizon]]$metrics_summary
+  test_metrics <- metrics[metrics$Dataset == "Test", ]
+  
+  # Line plot: Forecasted vs Actual for test set
+  p <- ggplot(test_results, aes(x = date)) +
+    geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
+    geom_line(aes(y = predicted, color = "Ridge Forecast"), linewidth = 0.8, linetype = "dashed") +
+    labs(
+      title = paste("Ridge Regression:", toupper(horizon), "Horizon - Test Set"),
+      x = "Date",
+      y = "Log Return",
+      color = "Series",
+      subtitle = paste("RMSE =", round(test_metrics$RMSE, 4))
+    ) +
+    scale_color_manual(values = c("Actual" = "steelblue", "Ridge Forecast" = "coral")) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p)
+}
+
+```
+
+```{r}
+# ---- Visualize Training Set: Forecasted vs Actual for Each Horizon ----
+
+for (horizon in c("3m", "6m", "12m")) {
+  
+  train_results <- ridge_results[[horizon]]$train_results
+  train_dates <- ridge_results[[horizon]]$train_data_dates
+  
+  # Add dates to results
+  train_results$date <- train_dates
+  
+  metrics <- ridge_results[[horizon]]$metrics_summary
+  train_metrics <- metrics[metrics$Dataset == "Training", ]
+  
+  # Line plot: Forecasted vs Actual for training set
+  p <- ggplot(train_results, aes(x = date)) +
+    geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
+    geom_line(aes(y = predicted, color = "Ridge Forecast"), linewidth = 0.8, linetype = "dashed") +
+    labs(
+      title = paste("Ridge Regression:", toupper(horizon), "Horizon - Training Set"),
+      x = "Date",
+      y = "Log Return",
+      color = "Series",
+      subtitle = paste("RMSE =", round(train_metrics$RMSE, 4))
+    ) +
+    scale_color_manual(values = c("Actual" = "steelblue", "Ridge Forecast" = "coral")) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p)
+}
+
+```
+
+```{r}
+# ---- Scatter Plots: Forecast Accuracy for Each Horizon (Test Set) ----
+
+for (horizon in c("3m", "6m", "12m")) {
+  
+  test_results <- ridge_results[[horizon]]$test_results
+  metrics <- ridge_results[[horizon]]$metrics_summary
+  test_metrics <- metrics[metrics$Dataset == "Test", ]
+  
+  p <- ggplot(test_results, aes(x = actual, y = predicted)) +
+    geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+    labs(
+      title = paste("Ridge Regression:", toupper(horizon), "Horizon - Test Set Accuracy"),
+      x = "Actual Return",
+      y = "Forecasted Return",
+      subtitle = paste("RMSE =", round(test_metrics$RMSE, 4))
+    ) +
+    theme_minimal() +
+    coord_fixed(ratio = 1)
+  
+  print(p)
+}
+
+```
+
+## Store Ridge Regression Results
+
+```{r}
+# ---- Combine Results Across All Horizons ----
+
+cat("\n========== STORING RIDGE REGRESSION RESULTS ==========\n")
+
+# Get dates for train and test sets
+train_dates <- train_data$date
+test_dates <- test_data$date
+
+# Initialize combined dataframes
+ridge_train_combined <- data.frame(
+  date = train_dates,
+  actual_3m = y_train_3m,
+  predicted_3m = ridge_results[["3m"]]$train_results$predicted,
+  actual_6m = y_train_6m,
+  predicted_6m = ridge_results[["6m"]]$train_results$predicted,
+  actual_12m = y_train_12m,
+  predicted_12m = ridge_results[["12m"]]$train_results$predicted
+)
+
+ridge_test_combined <- data.frame(
+  date = test_dates,
+  actual_3m = y_test_3m,
+  predicted_3m = ridge_results[["3m"]]$test_results$predicted,
+  actual_6m = y_test_6m,
+  predicted_6m = ridge_results[["6m"]]$test_results$predicted,
+  actual_12m = y_test_12m,
+  predicted_12m = ridge_results[["12m"]]$test_results$predicted
+)
+
+# Save to CSV
+write.csv(ridge_train_combined, "../data/ridge_train_predictions.csv", row.names = FALSE)
+write.csv(ridge_test_combined, "../data/ridge_test_predictions.csv", row.names = FALSE)
+
+cat("\n=== Results Saved ===\n")
+cat("✓ Training predictions saved to: ../data/ridge_train_predictions.csv\n")
+cat("✓ Test predictions saved to: ../data/ridge_test_predictions.csv\n")
+cat("✓ Columns: date, actual_3m, predicted_3m, actual_6m, predicted_6m, actual_12m, predicted_12m\n")
+
+# Display sample of results
+cat("\n=== Training Set Results (First 5 rows) ===\n")
+print(head(ridge_train_combined, 5))
+
+cat("\n=== Test Set Results (First 5 rows) ===\n")
+print(head(ridge_test_combined, 5))
+
+```
+
+```{r}
+# ---- Scatter Plots: Forecast Accuracy for Each Horizon (Training Set) ----
+
+for (horizon in c("3m", "6m", "12m")) {
+  
+  train_results <- ridge_results[[horizon]]$train_results
+  metrics <- ridge_results[[horizon]]$metrics_summary
+  train_metrics <- metrics[metrics$Dataset == "Training", ]
+  
+  p <- ggplot(train_results, aes(x = actual, y = predicted)) +
+    geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+    labs(
+      title = paste("Ridge Regression:", toupper(horizon), "Horizon - Training Set Accuracy"),
+      x = "Actual Return",
+      y = "Forecasted Return",
+      subtitle = paste("RMSE =", round(train_metrics$RMSE, 4))
+    ) +
+    theme_minimal() +
+    coord_fixed(ratio = 1)
+  
+  print(p)
 }
 
 ```
@@ -431,7 +848,4 @@ ggplot(train_results, aes(x = actual, y = forecasted)) +
   ) +
   theme_minimal() +
   coord_fixed(ratio = 1)
-
-```
-
 ```
