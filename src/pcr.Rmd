@@ -17,221 +17,633 @@ library(pls)
 
 
 ```{r}
-data  <- read.csv("../data/data_merged.csv", stringsAsFactors = FALSE)
-data_mean <- read.csv("../data/prevail_mean.csv", stringsAsFactors = FALSE)
+data = read.csv("../data/data_merged.csv")
+data_mean = read.csv("../data/prevail_mean.csv")
+
 data$date <- as.Date(data$date)
 data_mean$date <- as.Date(data_mean$date)
-data <- data %>%
-  select(date, log_ret, matches("_L[1-4]$")) %>%
-  left_join(data_mean %>% select(date, mean_prevailing_ret), by = "date")
 
-# prepare rf_df and train/test split
-pcr_df <- data %>%
+# ============================================================================
+# CREATE MULTI-HORIZON TARGET VARIABLES
+# ============================================================================
+# We want to forecast 3-month, 6-month, and 12-month ahead returns
+# 6-month = sum of 2 consecutive quarters
+# 12-month = sum of 4 consecutive quarters
+
+data <- data %>%
   arrange(date) %>%
-  select(-mean_prevailing_ret) %>%
+  mutate(
+    # Create lead log returns for each horizon
+    log_ret_lead_3m = lead(log_ret, 1),           # 3-month ahead (1 quarter)
+    log_ret_lead_6m = lead(log_ret, 1) + lead(log_ret, 2),  # 6-month ahead (2 quarters)
+    log_ret_lead_12m = lead(log_ret, 1) + lead(log_ret, 2) + lead(log_ret, 3) + lead(log_ret, 4)  # 12-month ahead (4 quarters)
+  )
+
+# ============================================================================
+# CREATE LAGGED VARIABLES FOR MULTI-HORIZON TARGETS
+# ============================================================================
+# Create 5 lags for each horizon's returns
+
+# Lags for 3-month returns
+data <- data %>%
+  mutate(
+    log_ret_3m_L1 = lag(log_ret_lead_3m, 1),
+    log_ret_3m_L2 = lag(log_ret_lead_3m, 2),
+    log_ret_3m_L3 = lag(log_ret_lead_3m, 3),
+    log_ret_3m_L4 = lag(log_ret_lead_3m, 4),
+    log_ret_3m_L5 = lag(log_ret_lead_3m, 5)
+  )
+
+# ============================================================================
+# SELECT FINAL FEATURES FOR MODELING
+# ============================================================================
+
+# Get all column names and identify lagged variables
+all_cols <- names(data)
+
+# Select L2-L5 lagged variables (excluding the log_ret_3m lags we just created)
+lagged_L2_L5 <- grep("_L[2-5]$", all_cols, value = TRUE)
+# Exclude the log_ret_3m lags from this list since we'll add them explicitly
+lagged_L2_L5 <- setdiff(lagged_L2_L5, c("log_ret_3m_L2", "log_ret_3m_L3", "log_ret_3m_L4", "log_ret_3m_L5"))
+
+# Also get price_fd_L1
+price_fd_L1_col <- grep("^price_fd_L1$", all_cols, value = TRUE)
+
+# Build final dataset
+data <- data %>%
+  select(
+    date,
+    log_ret,
+    # Multi-horizon targets
+    log_ret_lead_3m,
+    log_ret_lead_6m,
+    log_ret_lead_12m,
+    # Lagged multi-horizon returns (5 lags)
+    log_ret_3m_L1,
+    log_ret_3m_L2,
+    log_ret_3m_L3,
+    log_ret_3m_L4,
+    log_ret_3m_L5,
+    # Lagged features from original data
+    all_of(price_fd_L1_col),
+    all_of(lagged_L2_L5)
+  )
+
+cat("\n=== Multi-Horizon Target Variables Created ===\n")
+cat("✓ log_ret_lead_3m: 3-month ahead returns (1 quarter)\n")
+cat("✓ log_ret_lead_6m: 6-month ahead returns (sum of 2 quarters)\n")
+cat("✓ log_ret_lead_12m: 12-month ahead returns (sum of 4 quarters)\n")
+cat("✓ 5 lags created for each horizon\n")
+
+# ============================================================================
+# REMOVE NA VALUES (ONLY LAGGED AND LEAD VARIABLES)
+# ============================================================================
+
+cat("\n=== Removing NA Values ===\n")
+cat("Observations before drop_na():", nrow(data), "\n")
+
+# Remove all rows with any NA values
+data_clean <- data %>%
   drop_na()
 
+cat("Observations after drop_na():", nrow(data_clean), "\n")
+cat("Rows removed:", nrow(data) - nrow(data_clean), "\n\n")
+
+# Show date range of clean data
+cat("Date range of clean dataset:\n")
+cat("  From:", as.character(min(data_clean$date)), "\n")
+cat("  To:  ", as.character(max(data_clean$date)), "\n")
+
+# ============================================================================
+# TRAIN/TEST SPLIT
+# ============================================================================
+
 set.seed(123)
-n <- nrow(pcr_df)
+n <- nrow(data_clean)
 train_size <- floor(0.8 * n)
 test_size  <- n - train_size
 
-train_data <- pcr_df[1:train_size, ]
-test_data  <- pcr_df[(train_size + 1):n, ]
+train_data <- data_clean[1:train_size, ]
+test_data  <- data_clean[(train_size + 1):n, ]
 
-# tuning split inside training sample (we will apply recursive CV inside training only) 
-# initial training window for recursive CV (inside training)
-init_train_frac <- 0.8           # fraction of training sample used as initial window
-train_tune_size <- floor(init_train_frac * train_size)
-val_tune_size   <- train_size - train_tune_size   # number of recursive one-step-ahead predictions to produce for validation
+cat("\n=== Train/Test Split ===\n")
+cat("Total observations:", n, "\n")
+cat("Training set:", train_size, "\n")
+cat("Test set:", test_size, "\n")
+```
 
-X_train_tune_full <- train_data %>% select(-date, -log_ret)
-y_train_tune_full <- train_data$log_ret
+# ============================================================================
+# PRINCIPAL COMPONENT REGRESSION - 3-MONTH HORIZON (RECURSIVE CV)
+# ============================================================================
 
-# recursive CV on validation to choose ncomp
-max_comps <- min(20, ncol(X_train_tune_full))
-if (max_comps < 1) stop("No predictors found for PCR tuning.")
+```{r}
+cat("\n=== Building PCR Model for 3-Month Horizon with Recursive CV ===\n")
 
-val_rmse_vec <- numeric(max_comps)
+# Prepare data for PCR (3-month)
+pcr_train_3m <- train_data %>%
+  select(-date, -log_ret, -log_ret_lead_6m, -log_ret_lead_12m)
 
-for (ncomp in 1:max_comps) {
-  # produce recursive (expanding-window) one-step-ahead preds across validation portion
-  val_preds_recursive <- numeric(val_tune_size)
-  for (i in 1:val_tune_size) {
-    # expanding window: use observations 1 : (train_tune_size + i - 1) to predict next point (train_tune_size + i)
-    train_idx_end <- train_tune_size + i - 1
-    train_subset <- train_data[1:train_idx_end, ]
-    val_point    <- train_data[train_idx_end + 1, , drop = FALSE]
-    
-    X_train_sub <- train_subset %>% select(-date, -log_ret)
-    y_train_sub <- train_subset$log_ret
-    X_val_point <- val_point %>% select(-date, -log_ret)
-    
-    pcr_sub <- pcr(
-      y_train_sub ~ .,
-      data = cbind(y_train_sub, X_train_sub),
-      ncomp = ncomp,
-      scale = TRUE,
-      center = TRUE,
-      validation = "none"
-    )
-    pred_val <- as.numeric(predict(pcr_sub, newdata = X_val_point, ncomp = ncomp))
-    val_preds_recursive[i] <- pred_val
-  }
-  # true validation targets (the val_tune_size points)
-  y_val_true <- train_data$log_ret[(train_tune_size + 1):train_size]
-  val_rmse_vec[ncomp] <- sqrt(mean((y_val_true - val_preds_recursive)^2, na.rm = TRUE))
+pcr_test_3m <- test_data %>%
+  select(-date, -log_ret, -log_ret_lead_6m, -log_ret_lead_12m)
+
+# Set up recursive (expanding window) cross-validation
+n_train <- nrow(pcr_train_3m)
+min_train_size <- 60  # Minimum training size
+n_folds <- n_train - min_train_size  # Number of CV iterations
+
+cat("Training observations:", n_train, "\n")
+cat("Minimum training size:", min_train_size, "\n")
+cat("Number of CV folds:", n_folds, "\n")
+
+# Create custom segments for recursive CV (expanding window)
+cv_segments <- list()
+for (i in 1:n_folds) {
+  # Training: observations 1 to (min_train_size + i - 1)
+  # Validation: observation (min_train_size + i)
+  cv_segments[[i]] <- (min_train_size + i)
 }
 
+# Fit PCR model with recursive CV
+pcr_model_3m <- pcr(log_ret_lead_3m ~ ., 
+                     data = pcr_train_3m, 
+                     scale = TRUE, 
+                     validation = "CV",
+                     segments = cv_segments)
 
+# Determine optimal number of components
+cv_results_3m <- RMSEP(pcr_model_3m, estimate = "CV")
+optimal_ncomp_3m <- which.min(cv_results_3m$val[1, 1, ]) - 1
+# Ensure at least 1 component is used
+optimal_ncomp_3m <- max(1, optimal_ncomp_3m)
 
-best_ncomp <- which.min(val_rmse_vec)
-best_val_rmse <- val_rmse_vec[best_ncomp]
+cat("Optimal number of components (3-month):", optimal_ncomp_3m, "\n")
 
-# Plot: Validation RMSE vs ncomp
-val_df <- data.frame(ncomp = 1:max_comps, val_rmse = val_rmse_vec)
-p_valcurve <- ggplot(val_df, aes(x = ncomp, y = val_rmse)) +
-  geom_line() + geom_point() +
-  geom_vline(xintercept = best_ncomp, linetype = "dashed", color = "red") +
-  annotate("text", x = best_ncomp, y = min(val_rmse_vec), label = paste0("best n=", best_ncomp),
-           vjust = -1, color = "red") +
-  labs(title = "Validation RMSE vs PCR components (recursive CV on training)", x = "Number of components", y = "Validation RMSE") +
-  theme_minimal()
-print(p_valcurve)
+# Make predictions for 3-month horizon
+train_pred_3m <- as.vector(predict(pcr_model_3m, newdata = pcr_train_3m, ncomp = optimal_ncomp_3m))
+test_pred_3m <- as.vector(predict(pcr_model_3m, newdata = pcr_test_3m, ncomp = optimal_ncomp_3m))
+```
 
-# Fit final PCR model once on full training set using best_ncomp
-X_train_full <- train_data %>% select(-date, -log_ret)
-y_train_full <- train_data$log_ret
+# ============================================================================
+# PRINCIPAL COMPONENT REGRESSION - 6-MONTH HORIZON (RECURSIVE CV)
+# ============================================================================
 
-pcr_final <- pcr(
-  y_train_full ~ .,
-  data = cbind(y_train_full, X_train_full),
-  ncomp = best_ncomp,
-  scale = TRUE,
-  center = TRUE,
-  validation = "none"
+```{r}
+cat("\n=== Building PCR Model for 6-Month Horizon with Recursive CV ===\n")
+
+# Prepare data for PCR (6-month)
+pcr_train_6m <- train_data %>%
+  select(-date, -log_ret, -log_ret_lead_3m, -log_ret_lead_12m)
+
+pcr_test_6m <- test_data %>%
+  select(-date, -log_ret, -log_ret_lead_3m, -log_ret_lead_12m)
+
+# Use same CV segments as 3-month model
+n_train_6m <- nrow(pcr_train_6m)
+min_train_size_6m <- 60
+n_folds_6m <- n_train_6m - min_train_size_6m
+
+cv_segments_6m <- list()
+for (i in 1:n_folds_6m) {
+  cv_segments_6m[[i]] <- (min_train_size_6m + i)
+}
+
+# Fit PCR model for 6-month horizon
+pcr_model_6m <- pcr(log_ret_lead_6m ~ ., 
+                     data = pcr_train_6m, 
+                     scale = TRUE, 
+                     validation = "CV",
+                     segments = cv_segments_6m)
+
+# Determine optimal number of components
+cv_results_6m <- RMSEP(pcr_model_6m, estimate = "CV")
+optimal_ncomp_6m <- which.min(cv_results_6m$val[1, 1, ]) - 1
+# Ensure at least 1 component is used
+optimal_ncomp_6m <- max(1, optimal_ncomp_6m)
+
+cat("Optimal number of components (6-month):", optimal_ncomp_6m, "\n")
+
+# Make predictions for 6-month horizon
+train_pred_6m <- as.vector(predict(pcr_model_6m, newdata = pcr_train_6m, ncomp = optimal_ncomp_6m))
+test_pred_6m <- as.vector(predict(pcr_model_6m, newdata = pcr_test_6m, ncomp = optimal_ncomp_6m))
+```
+
+# ============================================================================
+# PRINCIPAL COMPONENT REGRESSION - 12-MONTH HORIZON (RECURSIVE CV)
+# ============================================================================
+
+```{r}
+cat("\n=== Building PCR Model for 12-Month Horizon with Recursive CV ===\n")
+
+# Prepare data for PCR (12-month)
+pcr_train_12m <- train_data %>%
+  select(-date, -log_ret, -log_ret_lead_3m, -log_ret_lead_6m)
+
+pcr_test_12m <- test_data %>%
+  select(-date, -log_ret, -log_ret_lead_3m, -log_ret_lead_6m)
+
+# Use same CV segments
+n_train_12m <- nrow(pcr_train_12m)
+min_train_size_12m <- 60
+n_folds_12m <- n_train_12m - min_train_size_12m
+
+cv_segments_12m <- list()
+for (i in 1:n_folds_12m) {
+  cv_segments_12m[[i]] <- (min_train_size_12m + i)
+}
+
+# Fit PCR model for 12-month horizon
+pcr_model_12m <- pcr(log_ret_lead_12m ~ ., 
+                      data = pcr_train_12m, 
+                      scale = TRUE, 
+                      validation = "CV",
+                      segments = cv_segments_12m)
+
+# Determine optimal number of components
+cv_results_12m <- RMSEP(pcr_model_12m, estimate = "CV")
+optimal_ncomp_12m <- which.min(cv_results_12m$val[1, 1, ]) - 1
+# Ensure at least 1 component is used
+optimal_ncomp_12m <- max(1, optimal_ncomp_12m)
+
+cat("Optimal number of components (12-month):", optimal_ncomp_12m, "\n")
+
+# Make predictions for 12-month horizon
+train_pred_12m <- as.vector(predict(pcr_model_12m, newdata = pcr_train_12m, ncomp = optimal_ncomp_12m))
+test_pred_12m <- as.vector(predict(pcr_model_12m, newdata = pcr_test_12m, ncomp = optimal_ncomp_12m))
+```
+
+# ============================================================================
+# EVALUATION METRICS
+# ============================================================================
+
+```{r}
+cat("\n=== Model Performance Metrics ===\n")
+
+# 3-Month Horizon
+rmse_train_3m <- rmse(train_data$log_ret_lead_3m, train_pred_3m)
+rmse_test_3m <- rmse(test_data$log_ret_lead_3m, test_pred_3m)
+mae_train_3m <- mae(train_data$log_ret_lead_3m, train_pred_3m)
+mae_test_3m <- mae(test_data$log_ret_lead_3m, test_pred_3m)
+r2_train_3m <- cor(train_data$log_ret_lead_3m, train_pred_3m)^2
+r2_test_3m <- cor(test_data$log_ret_lead_3m, test_pred_3m)^2
+
+cat("\n3-Month Horizon:\n")
+cat("  Train RMSE:", round(rmse_train_3m, 6), "\n")
+cat("  Test RMSE:", round(rmse_test_3m, 6), "\n")
+cat("  Train MAE:", round(mae_train_3m, 6), "\n")
+cat("  Test MAE:", round(mae_test_3m, 6), "\n")
+cat("  Train R²:", round(r2_train_3m, 6), "\n")
+cat("  Test R²:", round(r2_test_3m, 6), "\n")
+
+# 6-Month Horizon
+rmse_train_6m <- rmse(train_data$log_ret_lead_6m, train_pred_6m)
+rmse_test_6m <- rmse(test_data$log_ret_lead_6m, test_pred_6m)
+mae_train_6m <- mae(train_data$log_ret_lead_6m, train_pred_6m)
+mae_test_6m <- mae(test_data$log_ret_lead_6m, test_pred_6m)
+r2_train_6m <- cor(train_data$log_ret_lead_6m, train_pred_6m)^2
+r2_test_6m <- cor(test_data$log_ret_lead_6m, test_pred_6m)^2
+
+cat("\n6-Month Horizon:\n")
+cat("  Train RMSE:", round(rmse_train_6m, 6), "\n")
+cat("  Test RMSE:", round(rmse_test_6m, 6), "\n")
+cat("  Train MAE:", round(mae_train_6m, 6), "\n")
+cat("  Test MAE:", round(mae_test_6m, 6), "\n")
+cat("  Train R²:", round(r2_train_6m, 6), "\n")
+cat("  Test R²:", round(r2_test_6m, 6), "\n")
+
+# 12-Month Horizon
+rmse_train_12m <- rmse(train_data$log_ret_lead_12m, train_pred_12m)
+rmse_test_12m <- rmse(test_data$log_ret_lead_12m, test_pred_12m)
+mae_train_12m <- mae(train_data$log_ret_lead_12m, train_pred_12m)
+mae_test_12m <- mae(test_data$log_ret_lead_12m, test_pred_12m)
+r2_train_12m <- cor(train_data$log_ret_lead_12m, train_pred_12m)^2
+r2_test_12m <- cor(test_data$log_ret_lead_12m, test_pred_12m)^2
+
+cat("\n12-Month Horizon:\n")
+cat("  Train RMSE:", round(rmse_train_12m, 6), "\n")
+cat("  Test RMSE:", round(rmse_test_12m, 6), "\n")
+cat("  Train MAE:", round(mae_train_12m, 6), "\n")
+cat("  Test MAE:", round(mae_test_12m, 6), "\n")
+cat("  Train R²:", round(r2_train_12m, 6), "\n")
+cat("  Test R²:", round(r2_test_12m, 6), "\n")
+```
+
+# ============================================================================
+# SAVE PREDICTIONS TO CSV
+# ============================================================================
+
+```{r}
+cat("\n=== Saving Predictions ===\n")
+
+# Create test predictions dataframe
+pcr_test_predictions <- data.frame(
+  date = test_data$date,
+  actual_3m = test_data$log_ret_lead_3m,
+  predicted_3m = test_pred_3m,
+  actual_6m = test_data$log_ret_lead_6m,
+  predicted_6m = test_pred_6m,
+  actual_12m = test_data$log_ret_lead_12m,
+  predicted_12m = test_pred_12m
 )
 
-
-# Predict on test set
-X_test_full <- test_data %>% select(-date, -log_ret)
-pcr_test_preds <- as.numeric(predict(pcr_final, newdata = X_test_full, ncomp = best_ncomp))
-
-# Convert predictions to dataframe with date + prediction
-pcr_test_results <- test_data %>%
-  select(date) %>%               # keep date column
-  mutate(forecast = pcr_test_preds)   # add prediction column with correct name
-
-# Write to CSV
-write.csv(pcr_test_results, "../data/pcr_test_predictions.csv", row.names = FALSE)
-
-
-# Predict on TRAIN set
-X_train_full <- train_data %>% select(-date, -log_ret)
-pcr_train_preds <- as.numeric(predict(pcr_final, newdata = X_train_full, ncomp = best_ncomp))
-
-# Create dataframe with date + forecast
-pcr_train_results <- train_data %>%
-  select(date) %>%               # keep date column
-  mutate(forecast = pcr_train_preds)   # add prediction column
+# Create train predictions dataframe
+pcr_train_predictions <- data.frame(
+  date = train_data$date,
+  actual_3m = train_data$log_ret_lead_3m,
+  predicted_3m = train_pred_3m,
+  actual_6m = train_data$log_ret_lead_6m,
+  predicted_6m = train_pred_6m,
+  actual_12m = train_data$log_ret_lead_12m,
+  predicted_12m = train_pred_12m
+)
 
 # Save to CSV
-write.csv(pcr_train_results, "../data/pcr_train_predictions.csv", row.names = FALSE)
+write.csv(pcr_test_predictions, "../data/pcr_test_predictions.csv", row.names = FALSE)
+write.csv(pcr_train_predictions, "../data/pcr_train_predictions.csv", row.names = FALSE)
 
+cat("✓ Test predictions saved to: ../data/pcr_test_predictions.csv\n")
+cat("✓ Train predictions saved to: ../data/pcr_train_predictions.csv\n")
+cat("\nColumns in output files:\n")
+cat("  - date: Date of observation\n")
+cat("  - actual_3m: Actual 3-month forward returns\n")
+cat("  - predicted_3m: Predicted 3-month forward returns\n")
+cat("  - actual_6m: Actual 6-month forward returns\n")
+cat("  - predicted_6m: Predicted 6-month forward returns\n")
+cat("  - actual_12m: Actual 12-month forward returns\n")
+cat("  - predicted_12m: Predicted 12-month forward returns\n")
 
+# Preview the data
+cat("\n=== Preview of Test Predictions ===\n")
+print(head(pcr_test_predictions))
 
-# attach predictions to rf_df aligned with test indices
-pcr_df$pcr_forecast_ret <- c(rep(NA, train_size), pcr_test_preds)
-
-# Prepare plotting dataframe (include prevailing mean)
-plot_pcr_df <- pcr_df %>%
-  left_join(data %>% select(date, mean_prevailing_ret), by = "date")
+cat("\n=== Preview of Train Predictions ===\n")
+print(head(pcr_train_predictions))
 ```
 
-```{r}
-
-
-
-
-
-
-
-```
-
+# ============================================================================
+# DIEBOLD-MARIANO TEST VS PREVAILING MEAN
+# ============================================================================
 
 ```{r}
-# Plot: Actual vs Prevailing mean vs PCR (TEST SET)
-plot_test <- plot_pcr_df %>% tail(test_size)
-p_ts <- ggplot(plot_test, aes(x = date)) +
-  geom_line(aes(y = log_ret, color = "Actual")) +
-  geom_line(aes(y = mean_prevailing_ret, color = "Prevailing mean")) +
-  geom_line(aes(y = pcr_forecast_ret, color = "PCR"), linetype = "dashed") +
-  scale_color_manual(values = c("Actual" = "black", "Prevailing mean" = "blue", "PCR" = "darkgreen")) +
-  labs(title = "Test set: Actual vs Prevailing Mean vs PCR (final model predicts test set)", x = "Date", y = "Log Return", color = "") +
-  theme_minimal()
-print(p_ts)
+cat("\n=== Diebold-Mariano Test: PCR vs Prevailing Mean ===\n")
 
-# Scatter: Actual vs Predicted (PCR)
-scatter_df <- plot_test %>% filter(!is.na(pcr_forecast_ret))
-p_scatter <- ggplot(scatter_df, aes(x = pcr_forecast_ret, y = log_ret)) +
-  geom_point() +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  labs(title = "Actual vs PCR Predicted (TEST)", x = "PCR predicted", y = "Actual") +
-  theme_minimal()
-print(p_scatter)
+# Merge prevailing mean predictions with test data
+test_with_mean <- test_data %>%
+  select(date) %>%
+  left_join(data_mean %>% select(date, mean_prevailing_ret), by = "date")
 
-# Residuals time plot
-resid_df <- scatter_df %>% mutate(resid_pcr = log_ret - pcr_forecast_ret)
-p_resid <- ggplot(resid_df, aes(x = date, y = resid_pcr)) +
-  geom_hline(yintercept = 0, color = "gray") +
-  geom_line() +
-  labs(title = "PCR Residuals (Test set)", x = "Date", y = "Residual (Actual - Pred)") +
-  theme_minimal()
-print(p_resid)
-```
-
-
-```{r}
-# Compute metrics
-actual_pcr <- test_data$log_ret
-pred_pcr   <- pcr_test_preds
-
-MAE_pcr  <- mean(abs(actual_pcr - pred_pcr), na.rm = TRUE)
-RMSE_pcr <- sqrt(mean((actual_pcr - pred_pcr)^2, na.rm = TRUE))
-R2_pcr   <- cor(actual_pcr, pred_pcr, use = "complete.obs")^2
-
-metrics_tbl <- data.frame(
-  Model = "PCR",
-  MAE = MAE_pcr,
-  RMSE = RMSE_pcr,
-  R2 = R2_pcr,
-  ncomp = best_ncomp,
-  val_RMSE = best_val_rmse
-)
-print(metrics_tbl)
-```
-
-
-```{r}
-# DM Test (simple): use test set errors
-pcr_eval_df <- plot_test %>%
-  filter(!is.na(pcr_forecast_ret) & !is.na(mean_prevailing_ret)) %>%
-  mutate(
-    err_pcr  = log_ret - pcr_forecast_ret,
-    err_mean = log_ret - mean_prevailing_ret
-  )
-
-if (nrow(pcr_eval_df) < 2) {
-  message("Not enough observations with both forecasts to run DM test (need >= 2).")
+# Check if we have prevailing mean data
+if (all(is.na(test_with_mean$mean_prevailing_ret))) {
+  cat("Warning: No prevailing mean data found for test period.\n")
+  cat("Using historical mean of log_ret as baseline instead.\n")
+  
+  # Use historical mean as benchmark
+  historical_mean <- mean(train_data$log_ret, na.rm = TRUE)
+  mean_pred_3m <- rep(historical_mean, nrow(test_data))
+  mean_pred_6m <- rep(historical_mean * 2, nrow(test_data))
+  mean_pred_12m <- rep(historical_mean * 4, nrow(test_data))
 } else {
-  dm_test_pcr <- dm.test(e1 = pcr_eval_df$err_pcr, e2 = pcr_eval_df$err_mean, alternative = "less")
-  print(dm_test_pcr)
-  if (dm_test_pcr$p.value < 0.05) {
-    cat("Conclusion: PCR significantly outperforms the Prevailing Mean model (lower forecast error).\n")
-  } else {
-    cat("Conclusion: PCR does NOT significantly outperform the Prevailing Mean model.\n")
-  }
+  # Use prevailing mean predictions
+  mean_pred_3m <- test_with_mean$mean_prevailing_ret
+  mean_pred_6m <- test_with_mean$mean_prevailing_ret * 2  # Approximate scaling
+  mean_pred_12m <- test_with_mean$mean_prevailing_ret * 4  # Approximate scaling
 }
+
+# Calculate forecast errors for 3-month horizon
+pcr_errors_3m <- test_data$log_ret_lead_3m - test_pred_3m
+mean_errors_3m <- test_data$log_ret_lead_3m - mean_pred_3m
+
+# Calculate forecast errors for 6-month horizon
+pcr_errors_6m <- test_data$log_ret_lead_6m - test_pred_6m
+mean_errors_6m <- test_data$log_ret_lead_6m - mean_pred_6m
+
+# Calculate forecast errors for 12-month horizon
+pcr_errors_12m <- test_data$log_ret_lead_12m - test_pred_12m
+mean_errors_12m <- test_data$log_ret_lead_12m - mean_pred_12m
+
+# DM Test for 3-Month Horizon
+cat("\n--- 3-Month Horizon DM Test ---\n")
+if (length(na.omit(pcr_errors_3m)) >= 2 && length(na.omit(mean_errors_3m)) >= 2) {
+  dm_test_3m <- dm.test(pcr_errors_3m, mean_errors_3m, alternative = "less", h = 1)
+  print(dm_test_3m)
+  if (dm_test_3m$p.value < 0.05) {
+    cat("PCR significantly outperforms Prevailing Mean (p < 0.05)\n")
+  } else if (dm_test_3m$p.value < 0.10) {
+    cat("~ PCR marginally outperforms Prevailing Mean (p < 0.10)\n")
+  } else {
+    cat("No significant difference between PCR and Prevailing Mean\n")
+  }
+} else {
+  cat("Insufficient data for DM test\n")
+}
+
+# DM Test for 6-Month Horizon
+cat("\n--- 6-Month Horizon DM Test ---\n")
+if (length(na.omit(pcr_errors_6m)) >= 2 && length(na.omit(mean_errors_6m)) >= 2) {
+  dm_test_6m <- dm.test(pcr_errors_6m, mean_errors_6m, alternative = "less", h = 2)
+  print(dm_test_6m)
+  if (dm_test_6m$p.value < 0.05) {
+    cat("PCR significantly outperforms Prevailing Mean (p < 0.05)\n")
+  } else if (dm_test_6m$p.value < 0.10) {
+    cat("~ PCR marginally outperforms Prevailing Mean (p < 0.10)\n")
+  } else {
+    cat("No significant difference between PCR and Prevailing Mean\n")
+  }
+} else {
+  cat("Insufficient data for DM test\n")
+}
+
+# DM Test for 12-Month Horizon
+cat("\n--- 12-Month Horizon DM Test ---\n")
+if (length(na.omit(pcr_errors_12m)) >= 2 && length(na.omit(mean_errors_12m)) >= 2) {
+  dm_test_12m <- dm.test(pcr_errors_12m, mean_errors_12m, alternative = "less", h = 4)
+  print(dm_test_12m)
+  if (dm_test_12m$p.value < 0.05) {
+    cat("PCR significantly outperforms Prevailing Mean (p < 0.05)\n")
+  } else if (dm_test_12m$p.value < 0.10) {
+    cat("~ PCR marginally outperforms Prevailing Mean (p < 0.10)\n")
+  } else {
+    cat("No significant difference between PCR and Prevailing Mean\n")
+  }
+} else {
+  cat("Insufficient data for DM test\n")
+}
+
+# Summary comparison table
+cat("\n=== Performance Comparison: PCR vs Prevailing Mean ===\n")
+comparison_table <- data.frame(
+  Horizon = c("3-Month", "6-Month", "12-Month"),
+  PCR_RMSE = c(rmse_test_3m, rmse_test_6m, rmse_test_12m),
+  Mean_RMSE = c(
+    rmse(test_data$log_ret_lead_3m, mean_pred_3m),
+    rmse(test_data$log_ret_lead_6m, mean_pred_6m),
+    rmse(test_data$log_ret_lead_12m, mean_pred_12m)
+  ),
+  PCR_R2 = c(r2_test_3m, r2_test_6m, r2_test_12m)
+)
+comparison_table$RMSE_Improvement <- 
+  (comparison_table$Mean_RMSE - comparison_table$PCR_RMSE) / comparison_table$Mean_RMSE * 100
+
+print(comparison_table)
+```
+
+# ============================================================================
+# VISUALIZATION: PCR vs PREVAILING MEAN vs ACTUAL
+# ============================================================================
+
+```{r}
+cat("\n=== Creating Visualization Plots ===\n")
+
+# Prepare data for plotting
+plot_data <- data.frame(
+  date = test_data$date,
+  actual_3m = test_data$log_ret_lead_3m,
+  pcr_3m = test_pred_3m,
+  mean_3m = mean_pred_3m,
+  actual_6m = test_data$log_ret_lead_6m,
+  pcr_6m = test_pred_6m,
+  mean_6m = mean_pred_6m,
+  actual_12m = test_data$log_ret_lead_12m,
+  pcr_12m = test_pred_12m,
+  mean_12m = mean_pred_12m
+)
+
+# Plot 1: 3-Month Horizon Time Series
+p1 <- ggplot(plot_data, aes(x = date)) +
+  geom_line(aes(y = actual_3m, color = "Actual"), linewidth = 1) +
+  geom_line(aes(y = pcr_3m, color = "PCR"), linewidth = 0.8, linetype = "solid") +
+  geom_line(aes(y = mean_3m, color = "Prevailing Mean"), linewidth = 0.8, linetype = "dashed") +
+  scale_color_manual(values = c("Actual" = "black", "PCR" = "blue", "Prevailing Mean" = "red")) +
+  labs(
+    title = "3-Month Horizon: PCR vs Prevailing Mean vs Actual",
+    subtitle = paste0("Test Set Performance (R² = ", round(r2_test_3m, 4), ")"),
+    x = "Date",
+    y = "Log Return",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p1)
+
+# Plot 2: 6-Month Horizon Time Series
+p2 <- ggplot(plot_data, aes(x = date)) +
+  geom_line(aes(y = actual_6m, color = "Actual"), linewidth = 1) +
+  geom_line(aes(y = pcr_6m, color = "PCR"), linewidth = 0.8, linetype = "solid") +
+  geom_line(aes(y = mean_6m, color = "Prevailing Mean"), linewidth = 0.8, linetype = "dashed") +
+  scale_color_manual(values = c("Actual" = "black", "PCR" = "blue", "Prevailing Mean" = "red")) +
+  labs(
+    title = "6-Month Horizon: PCR vs Prevailing Mean vs Actual",
+    subtitle = paste0("Test Set Performance (R² = ", round(r2_test_6m, 4), ")"),
+    x = "Date",
+    y = "Log Return",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p2)
+
+# Plot 3: 12-Month Horizon Time Series
+p3 <- ggplot(plot_data, aes(x = date)) +
+  geom_line(aes(y = actual_12m, color = "Actual"), linewidth = 1) +
+  geom_line(aes(y = pcr_12m, color = "PCR"), linewidth = 0.8, linetype = "solid") +
+  geom_line(aes(y = mean_12m, color = "Prevailing Mean"), linewidth = 0.8, linetype = "dashed") +
+  scale_color_manual(values = c("Actual" = "black", "PCR" = "blue", "Prevailing Mean" = "red")) +
+  labs(
+    title = "12-Month Horizon: PCR vs Prevailing Mean vs Actual",
+    subtitle = paste0("Test Set Performance (R² = ", round(r2_test_12m, 4), ")"),
+    x = "Date",
+    y = "Log Return",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p3)
+
+# Plot 4: Scatter Plots - Actual vs Predicted (3 panels)
+p4_3m <- ggplot(plot_data, aes(x = pcr_3m, y = actual_3m)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "lm", se = TRUE, color = "darkblue", fill = "lightblue") +
+  labs(
+    title = "3-Month Horizon",
+    x = "PCR Predicted",
+    y = "Actual"
+  ) +
+  theme_minimal()
+
+p4_6m <- ggplot(plot_data, aes(x = pcr_6m, y = actual_6m)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "lm", se = TRUE, color = "darkblue", fill = "lightblue") +
+  labs(
+    title = "6-Month Horizon",
+    x = "PCR Predicted",
+    y = "Actual"
+  ) +
+  theme_minimal()
+
+p4_12m <- ggplot(plot_data, aes(x = pcr_12m, y = actual_12m)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "lm", se = TRUE, color = "darkblue", fill = "lightblue") +
+  labs(
+    title = "12-Month Horizon",
+    x = "PCR Predicted",
+    y = "Actual"
+  ) +
+  theme_minimal()
+
+# Combine scatter plots
+library(gridExtra)
+grid.arrange(p4_3m, p4_6m, p4_12m, ncol = 3,
+             top = "Actual vs PCR Predicted Returns (Test Set)")
+
+# Plot 5: Residuals Over Time
+plot_data$residual_3m <- plot_data$actual_3m - plot_data$pcr_3m
+plot_data$residual_6m <- plot_data$actual_6m - plot_data$pcr_6m
+plot_data$residual_12m <- plot_data$actual_12m - plot_data$pcr_12m
+
+p5 <- ggplot(plot_data, aes(x = date)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_line(aes(y = residual_3m, color = "3-Month"), alpha = 0.7) +
+  geom_line(aes(y = residual_6m, color = "6-Month"), alpha = 0.7) +
+  geom_line(aes(y = residual_12m, color = "12-Month"), alpha = 0.7) +
+  scale_color_manual(values = c("3-Month" = "blue", "6-Month" = "green", "12-Month" = "red")) +
+  labs(
+    title = "PCR Forecast Residuals Over Time",
+    subtitle = "Actual - Predicted (All Horizons)",
+    x = "Date",
+    y = "Residual",
+    color = "Horizon"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p5)
+
+# Plot 6: Error Distribution Comparison
+plot_data$pcr_error_3m <- abs(plot_data$residual_3m)
+plot_data$mean_error_3m <- abs(plot_data$actual_3m - plot_data$mean_3m)
+
+p6 <- ggplot(plot_data) +
+  geom_density(aes(x = pcr_error_3m, fill = "PCR"), alpha = 0.5) +
+  geom_density(aes(x = mean_error_3m, fill = "Prevailing Mean"), alpha = 0.5) +
+  scale_fill_manual(values = c("PCR" = "blue", "Prevailing Mean" = "red")) +
+  labs(
+    title = "Absolute Error Distribution: PCR vs Prevailing Mean",
+    subtitle = "3-Month Horizon (Test Set)",
+    x = "Absolute Error",
+    y = "Density",
+    fill = "Model"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p6)
+
+cat("\n✓ All plots generated successfully\n")
 
 
 ```

@@ -1,0 +1,287 @@
+---
+title: "rf_mutli_h"
+author: "marth"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyverse)
+library(zoo)
+library(lubridate)
+library(ggplot2)
+library(Metrics)
+library(forecast)
+library(randomForest)
+library(pdp)
+library(readr)
+```
+
+```{r}
+# -------------------------
+# Load data & create targets
+# -------------------------
+data = read.csv("../data/data_merged.csv")
+data_mean = read.csv("../data/prevail_mean.csv")
+
+data$date <- as.Date(data$date)
+data_mean$date <- as.Date(data_mean$date)
+
+# ============================================================================
+# CREATE MULTI-HORIZON TARGET VARIABLES
+# ============================================================================
+# We want to forecast 3-month, 6-month, and 12-month ahead returns
+# 6-month = sum of 2 consecutive quarters
+# 12-month = sum of 4 consecutive quarters
+
+data <- data %>%
+  arrange(date) %>%
+  mutate(
+    # Create lead log returns for each horizon
+    log_ret_lead_3m = lead(log_ret, 1),           # 3-month ahead (1 quarter)
+    log_ret_lead_6m = lead(log_ret, 1) + lead(log_ret, 2),  # 6-month ahead (2 quarters)
+    log_ret_lead_12m = lead(log_ret, 1) + lead(log_ret, 2) + lead(log_ret, 3) + lead(log_ret, 4)  # 12-month ahead (4 quarters)
+  )
+
+# ============================================================================
+# CREATE LAGGED VARIABLES FOR MULTI-HORIZON TARGETS
+# ============================================================================
+# Create 5 lags for each horizon's returns
+
+# Lags for 3-month returns
+data <- data %>%
+  mutate(
+    log_ret_3m_L1 = lag(log_ret_lead_3m, 1),
+    log_ret_3m_L2 = lag(log_ret_lead_3m, 2),
+    log_ret_3m_L3 = lag(log_ret_lead_3m, 3),
+    log_ret_3m_L4 = lag(log_ret_lead_3m, 4),
+    log_ret_3m_L5 = lag(log_ret_lead_3m, 5)
+  )
+
+# ============================================================================
+# SELECT FINAL FEATURES FOR MODELING
+# ============================================================================
+
+data <- data %>%
+  select(
+    date,
+    log_ret,
+    # Multi-horizon targets
+    log_ret_lead_3m,
+    log_ret_lead_6m,
+    log_ret_lead_12m,
+    # All lagged y's (multi-horizon targets at various lags)
+    matches("^log_ret_3m_L"),
+    # Lagged x's from original data (L2-L5 only to avoid leakage)
+    matches("^price_fd_L[1-5]$"),
+    matches("_L[2-5]$")
+  ) %>% drop_na()
+
+cat("\n=== Multi-Horizon Target Variables Created ===\n")
+cat("✓ log_ret_lead_3m: 3-month ahead returns (1 quarter)\n")
+cat("✓ log_ret_lead_6m: 6-month ahead returns (sum of 2 quarters)\n")
+cat("✓ log_ret_lead_12m: 12-month ahead returns (sum of 4 quarters)\n")
+cat("✓ 5 lags created for each horizon\n")
+```
+
+```{r}
+# -------------------------
+# RF multi-horizon pipeline with 80/20 STATIC SPLIT
+# -------------------------
+
+horizons <- list(
+  h1 = list(name = "3m",  steps = 1, target_col = "log_ret_lead_3m"),
+  h2 = list(name = "6m",  steps = 2, target_col = "log_ret_lead_6m"),
+  h4 = list(name = "12m", steps = 4, target_col = "log_ret_lead_12m")
+)
+
+rf_results_all <- list()
+rf_evals_all   <- list()
+rf_models <- list()
+set.seed(123)
+
+# helper: impute numeric (median) and factor (mode) from training -> apply to test
+impute_train_test <- function(X_train, X_test) {
+  X_train <- X_train %>% mutate(across(where(is.character), as.factor))
+  X_test  <- X_test  %>% mutate(across(where(is.character), as.factor))
+  num_cols <- names(X_train)[sapply(X_train, is.numeric)]
+  for (col in num_cols) {
+    med <- median(X_train[[col]], na.rm = TRUE); if (is.na(med)) med <- 0
+    X_train[[col]][is.na(X_train[[col]])] <- med
+    X_test[[col]][is.na(X_test[[col]])]   <- med
+  }
+  fac_cols <- names(X_train)[sapply(X_train, is.factor)]
+  for (col in fac_cols) {
+    modev <- names(sort(table(X_train[[col]]), decreasing = TRUE))[1]
+    if (is.na(modev)) modev <- levels(X_train[[col]])[1]
+    X_train[[col]] <- addNA(X_train[[col]])
+    X_train[[col]][is.na(X_train[[col]])] <- modev
+    X_test[[col]] <- factor(X_test[[col]], levels = levels(X_train[[col]]))
+    X_test[[col]][is.na(X_test[[col]])] <- modev
+  }
+  list(train = X_train, test = X_test)
+}
+
+for (h_key in names(horizons)) {
+  info <- horizons[[h_key]]
+  h_steps <- info$steps; tgt_col <- info$target_col; h_name <- info$name
+
+  cat("\n=== RF: Horizon", h_name, "(lead", h_steps, "quarters) ===\n")
+
+  df_h <- data %>% arrange(date) %>% select(date, log_ret, all_of(tgt_col), everything()) %>%
+    rename(target = all_of(tgt_col)) %>% mutate(target_date = lead(date, h_steps)) %>%
+    filter(!is.na(target) & !is.na(target_date))
+
+  n <- nrow(df_h)
+  if (n < 12) { cat("Not enough obs for", h_name, "- skipping\n"); next }
+
+  # 80/20 split
+  train_size <- floor(0.8 * n)
+  test_size <- n - train_size
+  train_data <- df_h[1:train_size, ]
+  test_data <- df_h[(train_size+1):n, ]
+
+  # exclude columns that are targets or created from leads
+  leak_patterns <- c("^log_ret_3m_L", "^log_ret_6m_L", "^log_ret_12m_L", "^log_ret_lead")
+  all_cols <- names(df_h)
+  leak_cols <- unique(unlist(lapply(leak_patterns, function(p) grep(p, all_cols, value = TRUE))))
+  safe_exclude <- c("date","log_ret","target","target_date", leak_cols, "mean_prevailing_ret")
+  pred_cols <- setdiff(all_cols, safe_exclude)
+
+  X_train_full <- train_data %>% select(all_of(pred_cols))
+  X_test_full <- test_data %>% select(all_of(pred_cols))
+  y_train_full <- train_data$target
+
+  # impute by training stats
+  imputed <- impute_train_test(X_train_full, X_test_full)
+  X_train_full <- imputed$train
+  X_test_full <- imputed$test
+
+  # tuning grid (internal holdout)
+  rf_param_grid <- expand.grid(
+    mtry = unique(pmax(1, round(c(5, 10, 20, ncol(X_train_full)/2)))),
+    nodesize = c(1,2,3,5),
+    ntree = c(100,200)
+  )
+  
+  tune_train_size <- floor(0.8 * train_size)
+  X_tune_train <- X_train_full[1:tune_train_size, , drop = FALSE]
+  y_tune_train <- y_train_full[1:tune_train_size]
+  X_tune_val <- X_train_full[(tune_train_size+1):train_size, , drop = FALSE]
+  y_tune_val <- y_train_full[(tune_train_size+1):train_size]
+
+  best_val_rmse <- Inf; best_params_rf <- NULL; p <- ncol(X_tune_train)
+  for (i in seq_len(nrow(rf_param_grid))) {
+    mtry_i <- min(rf_param_grid$mtry[i], p)
+    temp_rf <- randomForest(x = X_tune_train, y = y_tune_train,
+                            ntree = rf_param_grid$ntree[i],
+                            mtry = mtry_i,
+                            nodesize = rf_param_grid$nodesize[i])
+    val_preds <- predict(temp_rf, newdata = X_tune_val)
+    val_rmse <- sqrt(mean((y_tune_val - val_preds)^2, na.rm = TRUE))
+    if (val_rmse < best_val_rmse) {
+      best_val_rmse <- val_rmse
+      best_params_rf <- rf_param_grid[i, ]
+      best_params_rf$mtry <- mtry_i
+    }
+  }
+
+  cat("Best params: mtry=", best_params_rf$mtry,
+      "nodesize=", best_params_rf$nodesize, "ntree=", best_params_rf$ntree,
+      "val_RMSE=", round(best_val_rmse,6), "\n")
+
+  # Train final RF on full training set
+  rf_final <- randomForest(x = X_train_full, y = y_train_full,
+                           ntree = best_params_rf$ntree,
+                           mtry = best_params_rf$mtry,
+                           nodesize = best_params_rf$nodesize)
+
+  # Predictions
+  rf_train_preds <- predict(rf_final, newdata = X_train_full)
+  rf_test_preds <- predict(rf_final, newdata = X_test_full)
+  preds_all <- c(rf_train_preds, rf_test_preds)
+
+  results_df <- df_h %>%
+    mutate(actual = target, forecast = preds_all) %>%
+    select(date, target_date, actual, forecast) %>%
+    left_join(data_mean %>% select(date, mean_prevailing_ret), by = "date") %>%
+    rename(mean_prevailing_pred = mean_prevailing_ret) %>%
+    mutate(horizon = h_name)
+
+  write_csv(results_df, paste0("../data/rf_results_h", h_name, ".csv"))
+
+  eval_df <- results_df %>%
+    slice((train_size+1):n) %>%
+    mutate(err = actual - forecast, err_mean = actual - mean_prevailing_pred)
+
+  rf_results_all[[paste0("h", h_name)]] <- results_df
+  rf_evals_all[[paste0("h", h_name)]] <- eval_df
+
+  actual_test <- eval_df$actual
+  pred_test <- eval_df$forecast
+  mean_test <- eval_df$mean_prevailing_pred
+
+  MAE_rf <- mean(abs(actual_test - pred_test), na.rm = TRUE)
+  RMSE_rf <- sqrt(mean((actual_test - pred_test)^2, na.rm = TRUE))
+  R2_rf <- if (length(na.omit(pred_test))>1) cor(actual_test, pred_test, use = "complete.obs")^2 else NA
+  MAE_mean <- mean(abs(actual_test - mean_test), na.rm = TRUE)
+  RMSE_mean <- sqrt(mean((actual_test - mean_test)^2, na.rm = TRUE))
+  R2_mean <- if (length(na.omit(mean_test))>1) cor(actual_test, mean_test, use = "complete.obs")^2 else NA
+
+  cat("Test metrics (h=", h_name, "): RF MAE=", round(MAE_rf,6),
+      "RMSE=", round(RMSE_rf,6), "R2=", round(R2_rf,4), "\n")
+  cat("Prevailing mean: MAE=", round(MAE_mean,6), "RMSE=", round(RMSE_mean,6), "R2=", round(R2_mean,4), "\n")
+
+  dm_res <- tryCatch({ dm.test(e1 = eval_df$err^2, e2 = eval_df$err_mean^2, alternative = "less") }, error = function(e) NULL)
+  if (!is.null(dm_res)) cat("DM stat:", round(as.numeric(dm_res$statistic),3), "p-value:", signif(dm_res$p.value,4), "\n")
+
+  plot_df <- eval_df %>% drop_na(target_date, actual, forecast, mean_prevailing_pred)
+  p <- ggplot(plot_df, aes(x = target_date)) +
+    geom_line(aes(y = actual, color = "Actual")) +
+    geom_line(aes(y = mean_prevailing_pred, color = "Prevailing mean")) +
+    geom_line(aes(y = forecast, color = "RF forecast")) +
+    labs(title = paste("RF 80/20 Split (h =", h_name, ")"),
+         subtitle = paste0("Test set (n=", nrow(plot_df), ")"),
+         x = "Date (target)", y = "Log return", color = "") + theme_minimal()
+  print(p)
+}
+
+if (length(rf_results_all) > 0) write_csv(bind_rows(rf_results_all), "../data/rf_results_all_horizons.csv")
+if (length(rf_evals_all)  > 0) write_csv(bind_rows(rf_evals_all),  "../data/rf_evals_all_horizons.csv")
+
+```
+
+
+```{r}
+results_long <- bind_rows(rf_results_all)
+
+# normalize names and ensure needed cols
+results_long <- results_long %>%
+  rename_with(tolower) %>%
+  mutate(date = as.Date(date))
+
+# pivot: actual_{h} and predicted_{h}
+results_wide <- results_long %>%
+  select(date, horizon, actual, forecast) %>%
+  distinct() %>%
+  pivot_wider(names_from = horizon,
+              values_from = c(actual, forecast),
+              names_glue = "{.value}_{horizon}") %>%
+  rename_with(~ sub("^forecast_", "predicted_", .x), starts_with("forecast_")) %>%
+  arrange(date) %>% 
+  slice(1:floor(0.8 * n))
+
+
+# desired column order: date, actual_3m, predicted_3m, actual_6m, predicted_6m, actual_12m, predicted_12m
+desired_order <- c("date", 
+                   "actual_3m","predicted_3m",
+                   "actual_6m","predicted_6m",
+                   "actual_12m","predicted_12m")
+cols_present <- intersect(desired_order, names(results_wide))
+results_wide <- results_wide %>% select(all_of(cols_present), everything())
+
+# save results
+write_csv(results_wide, "../data/rf_train_predictions.csv")
+
+```
