@@ -1,0 +1,616 @@
+---
+title: "Ensemble Model Using LSEI"
+author: "Ensemble Team"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# SETTING UP LIBRARIES
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(knitr)
+library(scales)
+library(limSolve)  # For lsei() function
+```
+
+# Ensemble Model Overview
+
+## Methodology: Stacking with LSEI
+
+**Ensemble Approach:**
+- Combine predictions from multiple base models (RF, XGBoost, Lasso, Ridge, PCR, Elastic Net)
+- Learn optimal weights using constrained least squares (LSEI)
+- Constraints: Weights sum to 1, all weights non-negative
+
+**Training Process:**
+1. Load training predictions from each base model (Q1-Q206)
+2. Use `lsei()` to find optimal combination weights
+3. Minimize: ||actual_returns - weighted_predictions||²
+4. Subject to: sum(weights) = 1, weights ≥ 0
+
+**Testing Process:**
+1. Apply learned weights to test predictions (Q207-Q258)
+2. Generate ensemble forecast for each quarter
+3. Evaluate performance against individual models
+
+---
+
+# 1. Load Training Predictions
+
+## 1.1 Load Individual Model Predictions (Training Set)
+```{r load-training-predictions}
+cat("\n=== LOADING TRAINING PREDICTIONS FOR ENSEMBLE ===\n\n")
+
+# Each model team provides their training predictions (Q1-Q206)
+# File format: date, log_ret, [model]_forecast_ret
+
+# Random Forest training predictions
+rf_train <- read_csv("../data/rf_train_predictions.csv") %>%
+  select(date, log_ret, rf_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ Random Forest loaded:", nrow(rf_train), "observations\n")
+
+# XGBoost training predictions
+xgb_train <- read_csv("../data/xgb_train_predictions.csv") %>%
+  select(date, log_ret, xgb_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ XGBoost loaded:", nrow(xgb_train), "observations\n")
+
+# Lasso training predictions
+lasso_train <- read_csv("../data/lasso_train_predictions.csv") %>%
+  select(date, lasso_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ Lasso loaded:", nrow(lasso_train), "observations\n")
+
+# Ridge training predictions
+ridge_train <- read_csv("../data/ridge_train_predictions.csv") %>%
+  select(date, ridge_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ Ridge loaded:", nrow(ridge_train), "observations\n")
+
+# PCR training predictions
+pcr_train <- read_csv("../data/pcr_train_predictions.csv") %>%
+  select(date, pcr_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ PCR loaded:", nrow(pcr_train), "observations\n")
+
+# Elastic Net training predictions
+elastic_train <- read_csv("../data/elastic_train_predictions.csv") %>%
+  select(date, elastic_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ Elastic Net loaded:", nrow(elastic_train), "observations\n")
+
+cat("\n=== ALL TRAINING PREDICTIONS LOADED ===\n")
+cat("Date range:", min(rf_train$date), "to", max(rf_train$date), "\n\n")
+```
+
+## 1.2 Combine Training Predictions
+```{r combine-training}
+cat("=== COMBINING TRAINING PREDICTIONS ===\n\n")
+
+# Merge all training predictions by date
+train_ensemble <- rf_train %>%
+  left_join(xgb_train %>% select(date, xgb_forecast_ret), by = "date") %>%
+  left_join(lasso_train, by = "date") %>%
+  left_join(ridge_train, by = "date") %>%
+  left_join(pcr_train, by = "date") %>%
+  left_join(elastic_train, by = "date")
+
+# Remove any rows with missing predictions
+train_ensemble <- train_ensemble %>% drop_na()
+
+cat("Combined training dataset:\n")
+cat("  Total observations:", nrow(train_ensemble), "\n")
+cat("  Number of models:", ncol(train_ensemble) - 2, "\n")  # Subtract date and log_ret
+cat("  Date range:", min(train_ensemble$date), "to", max(train_ensemble$date), "\n")
+cat("\nColumns included:\n")
+print(names(train_ensemble))
+
+cat("\n=== SUMMARY STATISTICS (Training Set) ===\n")
+summary(train_ensemble %>% select(-date))
+```
+
+## 1.3 Visualize Training Predictions
+```{r plot-training-predictions, fig.width=12, fig.height=8}
+# Reshape data for plotting
+train_long <- train_ensemble %>%
+  pivot_longer(
+    cols = ends_with("_forecast_ret"),
+    names_to = "Model",
+    values_to = "Prediction"
+  ) %>%
+  mutate(Model = gsub("_forecast_ret", "", Model))
+
+# Plot predictions vs actual
+ggplot(train_long, aes(x = date)) +
+  geom_line(aes(y = log_ret), color = "black", linewidth = 1, alpha = 0.5) +
+  geom_line(aes(y = Prediction, color = Model), alpha = 0.7) +
+  labs(
+    title = "Training Set: Model Predictions vs Actual Returns",
+    subtitle = paste("Period:", min(train_ensemble$date), "to", max(train_ensemble$date)),
+    x = "Date",
+    y = "Log Return",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  )
+```
+
+---
+
+# 2. Learn Ensemble Weights Using LSEI
+
+## 2.1 Prepare Data for LSEI
+```{r prepare-lsei-data}
+cat("\n=== PREPARING DATA FOR LSEI ===\n\n")
+
+# Create prediction matrix (X)
+# Each column is a model's predictions
+X_train <- train_ensemble %>%
+  select(rf_forecast_ret, xgb_forecast_ret, lasso_forecast_ret, 
+         ridge_forecast_ret, pcr_forecast_ret, elastic_forecast_ret) %>%
+  as.matrix()
+
+# Actual returns vector (y)
+y_train <- train_ensemble$log_ret
+
+# Get model information
+n_models <- ncol(X_train)
+model_names <- colnames(X_train)
+
+cat("LSEI Problem Setup:\n")
+cat("  Number of models:", n_models, "\n")
+cat("  Model names:", paste(gsub("_forecast_ret", "", model_names), collapse = ", "), "\n")
+cat("  Training observations:", nrow(X_train), "\n")
+cat("  Target variable: Actual log returns (log_ret)\n\n")
+
+cat("Objective:\n")
+cat("  Minimize: ||y_actual - (w1*model1 + w2*model2 + ... + wn*modeln)||²\n\n")
+
+cat("Constraints:\n")
+cat("  1. Equality: sum(w1, w2, ..., wn) = 1 (weights sum to 100%)\n")
+cat("  2. Inequality: w1, w2, ..., wn ≥ 0 (non-negative weights)\n\n")
+```
+
+## 2.2 Set Up Constraints
+```{r setup-constraints}
+cat("=== SETTING UP LSEI CONSTRAINTS ===\n\n")
+
+# Equality constraint: sum(weights) = 1
+# E * weights = f
+# [1, 1, 1, ..., 1] * [w1, w2, ..., wn]' = 1
+E <- matrix(1, nrow = 1, ncol = n_models)
+f <- 1
+
+cat("Equality constraint matrix (E):\n")
+print(E)
+cat("Equality constraint value (f):", f, "\n\n")
+
+# Inequality constraint: weights >= 0
+# G * weights >= h
+# Identity matrix ensures each weight >= 0
+G <- diag(n_models)
+h <- rep(0, n_models)
+
+cat("Inequality constraint matrix (G):\n")
+print(G)
+cat("Inequality constraint values (h):", h, "\n\n")
+```
+
+## 2.3 Solve for Optimal Weights
+```{r solve-lsei}
+cat("=== SOLVING CONSTRAINED LEAST SQUARES ===\n\n")
+
+# Run LSEI optimization
+# Minimize ||X*weights - y||^2 subject to E*weights=f, G*weights>=h
+lsei_result <- lsei(A = X_train, B = y_train, E = E, F = f, G = G, H = h)
+
+# Extract optimal weights
+ensemble_weights <- lsei_result$X
+names(ensemble_weights) <- model_names
+
+cat("✓ LSEI optimization completed successfully!\n\n")
+
+cat("=================================================\n")
+cat("           OPTIMAL ENSEMBLE WEIGHTS              \n")
+cat("=================================================\n\n")
+
+# Display weights in a formatted table
+weights_display <- data.frame(
+  Model = gsub("_forecast_ret", "", model_names),
+  Weight = ensemble_weights,
+  Percentage = paste0(round(ensemble_weights * 100, 2), "%")
+)
+
+print(weights_display, row.names = FALSE)
+
+cat("\n-------------------------------------------------\n")
+cat("Sum of weights:", round(sum(ensemble_weights), 10), "\n")
+cat("(Should be exactly 1.0)\n")
+cat("=================================================\n\n")
+
+# Check which models are most important
+top_models <- weights_display %>%
+  arrange(desc(Weight)) %>%
+  head(3)
+
+cat("Top 3 models:\n")
+print(top_models, row.names = FALSE)
+```
+
+## 2.4 In-Sample Performance
+```{r in-sample-performance}
+cat("\n=== IN-SAMPLE PERFORMANCE EVALUATION ===\n\n")
+
+# Generate ensemble predictions on training set
+train_ensemble_pred <- as.vector(X_train %*% ensemble_weights)
+train_ensemble$ensemble_forecast_ret <- train_ensemble_pred
+
+# Calculate performance metrics
+train_errors <- train_ensemble$log_ret - train_ensemble$ensemble_forecast_ret
+train_mse <- mean(train_errors^2)
+train_rmse <- sqrt(train_mse)
+train_mae <- mean(abs(train_errors))
+train_r2 <- cor(train_ensemble$log_ret, train_ensemble$ensemble_forecast_ret)^2
+
+cat("ENSEMBLE Performance (Training Set):\n")
+cat("  RMSE:", round(train_rmse, 6), "\n")
+cat("  MAE :", round(train_mae, 6), "\n")
+cat("  R²  :", round(train_r2, 4), "\n\n")
+
+cat("=================================================\n")
+cat("      COMPARISON WITH INDIVIDUAL MODELS         \n")
+cat("=================================================\n")
+cat(sprintf("%-25s   RMSE      MAE       R²\n", "Model"))
+cat("-------------------------------------------------\n")
+
+# Calculate metrics for each individual model
+for (i in 1:n_models) {
+  model_errors <- train_ensemble$log_ret - X_train[, i]
+  model_rmse <- sqrt(mean(model_errors^2))
+  model_mae <- mean(abs(model_errors))
+  model_r2 <- cor(train_ensemble$log_ret, X_train[, i])^2
+  
+  model_name <- gsub("_forecast_ret", "", model_names[i])
+  cat(sprintf("%-25s  %.6f  %.6f  %.4f\n", 
+              model_name, model_rmse, model_mae, model_r2))
+}
+
+cat("-------------------------------------------------\n")
+cat(sprintf("%-25s  %.6f  %.6f  %.4f  <-- ENSEMBLE\n", 
+            "ENSEMBLE", train_rmse, train_mae, train_r2))
+cat("=================================================\n\n")
+
+# Calculate improvement over best individual model
+individual_rmses <- sapply(1:n_models, function(i) {
+  sqrt(mean((train_ensemble$log_ret - X_train[, i])^2))
+})
+best_individual_rmse <- min(individual_rmses)
+improvement_pct <- (best_individual_rmse - train_rmse) / best_individual_rmse * 100
+
+if (improvement_pct > 0) {
+  cat(sprintf("✓ Ensemble improves RMSE by %.2f%% over best individual model\n", improvement_pct))
+} else {
+  cat(sprintf("Note: Ensemble RMSE is %.2f%% higher than best individual model\n", abs(improvement_pct)))
+}
+```
+
+## 2.5 Visualize Ensemble Weights
+```{r plot-weights, fig.width=10, fig.height=6}
+# Create bar plot of ensemble weights
+weights_df <- data.frame(
+  Model = gsub("_forecast_ret", "", model_names),
+  Weight = ensemble_weights
+) %>%
+  arrange(desc(Weight))
+
+weights_df$Model <- factor(weights_df$Model, levels = weights_df$Model)
+
+ggplot(weights_df, aes(x = Model, y = Weight, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.1f%%", Weight * 100)), 
+            vjust = -0.5, size = 4, fontface = "bold") +
+  scale_y_continuous(labels = percent_format(), 
+                     limits = c(0, max(weights_df$Weight) * 1.15)) +
+  labs(
+    title = "Ensemble Model Weights (Learned via LSEI)",
+    subtitle = "Constrained: Sum to 100%, Non-negative",
+    x = "Model",
+    y = "Weight"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11)
+  )
+```
+
+---
+
+# 3. Apply Ensemble to Test Set
+
+## 3.1 Load Test Predictions
+```{r load-test-predictions}
+cat("\n=== LOADING TEST PREDICTIONS ===\n\n")
+
+# Load test predictions from each model (Q207-Q258)
+# These should match the test period used in your backtesting
+
+# Random Forest test predictions
+rf_test <- read_csv("../data/rf_evals.csv") %>%
+  select(date, log_ret, rf_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ Random Forest test loaded:", nrow(rf_test), "observations\n")
+
+# XGBoost test predictions
+xgb_test <- read_csv("../data/xgb_evals.csv") %>%
+  select(date, xgb_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ XGBoost test loaded:", nrow(xgb_test), "observations\n")
+
+# Lasso test predictions
+lasso_test <- read_csv("../data/lasso_predictions.csv") %>%
+  select(date, lasso_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ Lasso test loaded:", nrow(lasso_test), "observations\n")
+
+# Ridge test predictions
+ridge_test <- read_csv("../data/ridge_predictions.csv") %>%
+  select(date, ridge_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ Ridge test loaded:", nrow(ridge_test), "observations\n")
+
+# PCR test predictions
+pcr_test <- read_csv("../data/pcr_predictions.csv") %>%
+  select(date, pcr_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ PCR test loaded:", nrow(pcr_test), "observations\n")
+
+# Elastic Net test predictions
+elastic_test <- read_csv("../data/elastic_predictions.csv") %>%
+  select(date, elastic_forecast_ret) %>%
+  arrange(date)
+
+cat("✓ Elastic Net test loaded:", nrow(elastic_test), "observations\n")
+
+cat("\n=== ALL TEST PREDICTIONS LOADED ===\n")
+cat("Date range:", min(rf_test$date), "to", max(rf_test$date), "\n\n")
+```
+
+## 3.2 Combine Test Predictions
+```{r combine-test}
+cat("=== COMBINING TEST PREDICTIONS ===\n\n")
+
+# Merge all test predictions
+test_ensemble <- rf_test %>%
+  left_join(xgb_test, by = "date") %>%
+  left_join(lasso_test, by = "date") %>%
+  left_join(ridge_test, by = "date") %>%
+  left_join(pcr_test, by = "date") %>%
+  left_join(elastic_test, by = "date")
+
+test_ensemble <- test_ensemble %>% drop_na()
+
+cat("Combined test dataset:\n")
+cat("  Observations:", nrow(test_ensemble), "\n")
+cat("  Date range:", min(test_ensemble$date), "to", max(test_ensemble$date), "\n\n")
+```
+
+## 3.3 Generate Ensemble Predictions
+```{r generate-ensemble-predictions}
+cat("=== GENERATING ENSEMBLE PREDICTIONS ===\n\n")
+
+# Create test prediction matrix
+X_test <- test_ensemble %>%
+  select(rf_forecast_ret, xgb_forecast_ret, lasso_forecast_ret, 
+         ridge_forecast_ret, pcr_forecast_ret, elastic_forecast_ret) %>%
+  as.matrix()
+
+# Apply learned weights to generate ensemble predictions
+test_ensemble_pred <- as.vector(X_test %*% ensemble_weights)
+test_ensemble$ensemble_forecast_ret <- test_ensemble_pred
+
+cat("✓ Ensemble predictions generated!\n")
+cat("  Number of predictions:", length(test_ensemble_pred), "\n\n")
+
+cat("Sample ensemble predictions:\n")
+print(head(test_ensemble %>% select(date, log_ret, ensemble_forecast_ret), 10))
+```
+
+## 3.4 Out-of-Sample Performance
+```{r out-of-sample-performance}
+cat("\n=== OUT-OF-SAMPLE PERFORMANCE EVALUATION ===\n\n")
+
+# Calculate performance metrics
+test_errors <- test_ensemble$log_ret - test_ensemble$ensemble_forecast_ret
+test_mse <- mean(test_errors^2)
+test_rmse <- sqrt(test_mse)
+test_mae <- mean(abs(test_errors))
+test_r2 <- cor(test_ensemble$log_ret, test_ensemble$ensemble_forecast_ret)^2
+
+cat("ENSEMBLE Performance (Test Set):\n")
+cat("  RMSE:", round(test_rmse, 6), "\n")
+cat("  MAE :", round(test_mae, 6), "\n")
+cat("  R²  :", round(test_r2, 4), "\n\n")
+
+cat("=================================================\n")
+cat("      COMPARISON WITH INDIVIDUAL MODELS         \n")
+cat("=================================================\n")
+cat(sprintf("%-25s   RMSE      MAE       R²\n", "Model"))
+cat("-------------------------------------------------\n")
+
+# Calculate metrics for each individual model
+for (i in 1:n_models) {
+  model_errors <- test_ensemble$log_ret - X_test[, i]
+  model_rmse <- sqrt(mean(model_errors^2))
+  model_mae <- mean(abs(model_errors))
+  model_r2 <- cor(test_ensemble$log_ret, X_test[, i])^2
+  
+  model_name <- gsub("_forecast_ret", "", model_names[i])
+  cat(sprintf("%-25s  %.6f  %.6f  %.4f\n", 
+              model_name, model_rmse, model_mae, model_r2))
+}
+
+cat("-------------------------------------------------\n")
+cat(sprintf("%-25s  %.6f  %.6f  %.4f  <-- ENSEMBLE\n", 
+            "ENSEMBLE", test_rmse, test_mae, test_r2))
+cat("=================================================\n\n")
+
+# Calculate improvement over best individual model
+individual_rmses_test <- sapply(1:n_models, function(i) {
+  sqrt(mean((test_ensemble$log_ret - X_test[, i])^2))
+})
+best_individual_rmse_test <- min(individual_rmses_test)
+improvement_pct_test <- (best_individual_rmse_test - test_rmse) / best_individual_rmse_test * 100
+
+if (improvement_pct_test > 0) {
+  cat(sprintf("✓ Ensemble improves RMSE by %.2f%% over best individual model\n", improvement_pct_test))
+} else {
+  cat(sprintf("Note: Ensemble RMSE is %.2f%% higher than best individual model\n", abs(improvement_pct_test)))
+}
+```
+
+## 3.5 Visualize Test Predictions
+```{r plot-test-predictions, fig.width=12, fig.height=8}
+# Plot actual vs ensemble predictions
+ggplot(test_ensemble, aes(x = date)) +
+  geom_line(aes(y = log_ret, color = "Actual"), linewidth = 1) +
+  geom_line(aes(y = ensemble_forecast_ret, color = "Ensemble"), linewidth = 1, alpha = 0.8) +
+  scale_color_manual(values = c("Actual" = "black", "Ensemble" = "red")) +
+  labs(
+    title = "Test Set: Ensemble Predictions vs Actual Returns",
+    subtitle = paste("Period:", min(test_ensemble$date), "to", max(test_ensemble$date)),
+    x = "Date",
+    y = "Log Return",
+    color = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  )
+```
+
+## 3.6 Prediction Errors
+```{r plot-errors, fig.width=12, fig.height=6}
+# Plot prediction errors
+test_ensemble$error <- test_ensemble$log_ret - test_ensemble$ensemble_forecast_ret
+
+ggplot(test_ensemble, aes(x = date, y = error)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_line(color = "steelblue") +
+  geom_point(color = "steelblue", size = 2) +
+  labs(
+    title = "Ensemble Prediction Errors (Test Set)",
+    subtitle = paste("Mean Error:", round(mean(test_ensemble$error), 6), 
+                     "| Std Dev:", round(sd(test_ensemble$error), 6)),
+    x = "Date",
+    y = "Prediction Error"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+```
+
+---
+
+# 4. Save Ensemble Predictions
+
+## 4.1 Save for Backtesting
+```{r save-predictions}
+cat("\n=== SAVING ENSEMBLE PREDICTIONS ===\n\n")
+
+# Save test ensemble predictions for use in strategy_backtest.Rmd
+ensemble_output <- test_ensemble %>%
+  select(date, log_ret, ensemble_forecast_ret)
+
+write_csv(ensemble_output, "../data/ensemble_predictions.csv")
+
+cat("✓ Ensemble predictions saved to: ../data/ensemble_predictions.csv\n")
+cat("  Columns: date, log_ret, ensemble_forecast_ret\n")
+cat("  Rows:", nrow(ensemble_output), "\n\n")
+
+cat("=================================================\n")
+cat("This file can now be loaded in strategy_backtest.Rmd\n")
+cat("for tactical asset allocation backtesting!\n")
+cat("=================================================\n")
+```
+
+## 4.2 Save Ensemble Weights
+```{r save-weights}
+# Save weights for documentation
+weights_output <- data.frame(
+  model = gsub("_forecast_ret", "", model_names),
+  weight = ensemble_weights,
+  percentage = ensemble_weights * 100
+)
+
+write_csv(weights_output, "../data/ensemble_weights.csv")
+
+cat("\n✓ Ensemble weights saved to: ../data/ensemble_weights.csv\n\n")
+```
+
+---
+
+# 5. Summary
+
+## 5.1 Key Findings
+```{r summary}
+cat("\n=================================================\n")
+cat("           ENSEMBLE MODEL SUMMARY                \n")
+cat("=================================================\n\n")
+
+cat("METHODOLOGY:\n")
+cat("  - Technique: Stacking with LSEI (constrained least squares)\n")
+cat("  - Models combined:", n_models, "\n")
+cat("  - Training period:", min(train_ensemble$date), "to", max(train_ensemble$date), 
+    "(", nrow(train_ensemble), "quarters)\n")
+cat("  - Test period:", min(test_ensemble$date), "to", max(test_ensemble$date), 
+    "(", nrow(test_ensemble), "quarters)\n\n")
+
+cat("WEIGHTS LEARNED:\n")
+for (i in 1:n_models) {
+  model_name <- gsub("_forecast_ret", "", model_names[i])
+  cat(sprintf("  %-20s: %5.1f%%\n", model_name, ensemble_weights[i] * 100))
+}
+
+cat("\nPERFORMANCE (RMSE):\n")
+cat(sprintf("  Training set : %.6f\n", train_rmse))
+cat(sprintf("  Test set     : %.6f\n", test_rmse))
+
+if (improvement_pct_test > 0) {
+  cat(sprintf("\n✓ SUCCESS: Ensemble outperforms best individual model by %.2f%%\n", 
+              improvement_pct_test))
+} else {
+  cat(sprintf("\nNote: Best individual model outperforms ensemble by %.2f%%\n", 
+              abs(improvement_pct_test)))
+}
+
+cat("\n=================================================\n")
+cat("Next step: Use ensemble_predictions.csv in\n")
+cat("           strategy_backtest.Rmd for backtesting!\n")
+cat("=================================================\n")
+```
