@@ -1,0 +1,592 @@
+---
+title: "Multi-Horizon Ensemble LSEI - LOGIC DRAFT"
+author: "Ensemble Team"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# COMPLETE LOGIC FOR MULTI-HORIZON ENSEMBLE
+
+This document outlines the complete logic structure for creating 3 separate ensemble models (1Q, 6M, 1Y).
+Once you show me your actual data format, I'll adjust the column names accordingly.
+
+---
+
+## OVERVIEW: Multi-Horizon Strategy
+
+**Problem:** We need to make predictions at 3 different time horizons:
+- **1-Quarter (3 months)**: Rebalance every quarter
+- **6-Month (2 quarters)**: Rebalance every 6 months  
+- **1-Year (4 quarters)**: Rebalance annually
+
+**Solution:** Create 3 separate LSEI ensemble models, one for each horizon
+
+**Why Separate?** Because:
+1. Models may perform differently at different horizons
+2. A model good at short-term forecasting may not be good at long-term
+3. We want to learn optimal weights specific to each forecasting task
+
+---
+
+# PART 1: DATA STRUCTURE ASSUMPTIONS
+
+```
+INPUT FILES NEEDED:
+===================
+
+1. RF Training Predictions (rf_train_predictions.csv):
+   - date
+   - actual_1q, actual_6m, actual_1y  (actual returns at each horizon)
+   - rf_forecast_1q, rf_forecast_6m, rf_forecast_1y
+   
+2. XGBoost Training Predictions (xgb_train_predictions.csv):
+   - date
+   - actual_1q, actual_6m, actual_1y
+   - xgb_forecast_1q, xgb_forecast_6m, xgb_forecast_1y
+   
+3. PCR Training Predictions (pcr_train_predictions.csv):
+   - date
+   - actual_1q, actual_6m, actual_1y
+   - pcr_forecast_1q, pcr_forecast_6m, pcr_forecast_1y
+
+4. RF Test Predictions (rf_test_predictions.csv):
+   - Same structure as training
+   
+5. XGBoost Test Predictions (xgb_test_predictions.csv):
+   - Same structure as training
+   
+6. PCR Test Predictions (pcr_test_predictions.csv):
+   - Same structure as training
+```
+
+---
+
+# PART 2: LOAD & COMBINE TRAINING DATA
+
+## Step 2.1: Load Training Predictions
+
+```r
+# PSEUDO-CODE LOGIC:
+
+# Load RF
+rf_train <- read_csv("rf_train_predictions.csv") %>%
+  select(date, 
+         actual_1q, actual_6m, actual_1y,
+         rf_forecast_1q, rf_forecast_6m, rf_forecast_1y)
+
+# Load XGBoost  
+xgb_train <- read_csv("xgb_train_predictions.csv") %>%
+  select(date,
+         xgb_forecast_1q, xgb_forecast_6m, xgb_forecast_1y)
+         
+# Load PCR
+pcr_train <- read_csv("pcr_train_predictions.csv") %>%
+  select(date,
+         pcr_forecast_1q, pcr_forecast_6m, pcr_forecast_1y)
+```
+
+## Step 2.2: Combine Training Data
+
+```r
+# Merge all predictions by date
+train_combined <- rf_train %>%
+  left_join(xgb_train, by = "date") %>%
+  left_join(pcr_train, by = "date")
+
+# Result structure:
+# date | actual_1q | actual_6m | actual_1y | 
+#      | rf_forecast_1q | rf_forecast_6m | rf_forecast_1y |
+#      | xgb_forecast_1q | xgb_forecast_6m | xgb_forecast_1y |
+#      | pcr_forecast_1q | pcr_forecast_6m | pcr_forecast_1y
+```
+
+---
+
+# PART 3: CREATE 3 SEPARATE ENSEMBLE MODELS
+
+## ENSEMBLE 1: 1-Quarter Horizon
+
+### Step 3.1.1: Prepare Data for 1Q Ensemble
+
+```r
+cat("\n=== CREATING 1-QUARTER ENSEMBLE ===\n")
+
+# Prediction matrix: 3 models x N observations
+X_train_1q <- train_combined %>%
+  select(rf_forecast_1q, xgb_forecast_1q, pcr_forecast_1q) %>%
+  as.matrix()
+
+colnames(X_train_1q) <- c("RF", "XGBoost", "PCR")
+
+# Actual returns (target)
+y_train_1q <- train_combined$actual_1q
+
+n_models <- 3
+```
+
+### Step 3.1.2: Set Up Constraints for 1Q
+
+```r
+# Equality: sum(weights) = 1
+E <- matrix(1, nrow = 1, ncol = n_models)
+f <- 1
+
+# Inequality: all weights >= 0
+G <- diag(n_models)
+h <- rep(0, n_models)
+```
+
+### Step 3.1.3: Solve LSEI for 1Q Weights
+
+```r
+# Minimize ||X*weights - y||^2 subject to constraints
+lsei_1q <- lsei(A = X_train_1q, B = y_train_1q, E = E, F = f, G = G, H = h)
+
+# Extract weights
+weights_1q <- lsei_1q$X
+names(weights_1q) <- c("RF", "XGBoost", "PCR")
+
+cat("1Q Ensemble Weights:\n")
+print(weights_1q)
+```
+
+### Step 3.1.4: Evaluate 1Q In-Sample Performance
+
+```r
+# Generate ensemble predictions
+ensemble_pred_1q_train <- as.vector(X_train_1q %*% weights_1q)
+
+# Calculate metrics
+rmse_1q_train <- sqrt(mean((y_train_1q - ensemble_pred_1q_train)^2))
+mae_1q_train <- mean(abs(y_train_1q - ensemble_pred_1q_train))
+r2_1q_train <- cor(y_train_1q, ensemble_pred_1q_train)^2
+
+cat("1Q In-Sample Performance:\n")
+cat("  RMSE:", rmse_1q_train, "\n")
+cat("  MAE :", mae_1q_train, "\n")
+cat("  R²  :", r2_1q_train, "\n")
+```
+
+---
+
+## ENSEMBLE 2: 6-Month Horizon
+
+### Step 3.2.1: Prepare Data for 6M Ensemble
+
+```r
+cat("\n=== CREATING 6-MONTH ENSEMBLE ===\n")
+
+# Prediction matrix for 6M forecasts
+X_train_6m <- train_combined %>%
+  select(rf_forecast_6m, xgb_forecast_6m, pcr_forecast_6m) %>%
+  as.matrix()
+
+colnames(X_train_6m) <- c("RF", "XGBoost", "PCR")
+
+# Actual 6-month returns
+y_train_6m <- train_combined$actual_6m
+```
+
+### Step 3.2.2: Set Up Constraints for 6M
+
+```r
+# Same constraints as 1Q (weights sum to 1, all >= 0)
+E <- matrix(1, nrow = 1, ncol = n_models)
+f <- 1
+G <- diag(n_models)
+h <- rep(0, n_models)
+```
+
+### Step 3.2.3: Solve LSEI for 6M Weights
+
+```r
+# Minimize ||X*weights - y||^2 for 6-month horizon
+lsei_6m <- lsei(A = X_train_6m, B = y_train_6m, E = E, F = f, G = G, H = h)
+
+weights_6m <- lsei_6m$X
+names(weights_6m) <- c("RF", "XGBoost", "PCR")
+
+cat("6M Ensemble Weights:\n")
+print(weights_6m)
+```
+
+### Step 3.2.4: Evaluate 6M In-Sample Performance
+
+```r
+ensemble_pred_6m_train <- as.vector(X_train_6m %*% weights_6m)
+
+rmse_6m_train <- sqrt(mean((y_train_6m - ensemble_pred_6m_train)^2))
+mae_6m_train <- mean(abs(y_train_6m - ensemble_pred_6m_train))
+r2_6m_train <- cor(y_train_6m, ensemble_pred_6m_train)^2
+
+cat("6M In-Sample Performance:\n")
+cat("  RMSE:", rmse_6m_train, "\n")
+cat("  MAE :", mae_6m_train, "\n")
+cat("  R²  :", r2_6m_train, "\n")
+```
+
+---
+
+## ENSEMBLE 3: 1-Year Horizon
+
+### Step 3.3.1: Prepare Data for 1Y Ensemble
+
+```r
+cat("\n=== CREATING 1-YEAR ENSEMBLE ===\n")
+
+# Prediction matrix for 1Y forecasts
+X_train_1y <- train_combined %>%
+  select(rf_forecast_1y, xgb_forecast_1y, pcr_forecast_1y) %>%
+  as.matrix()
+
+colnames(X_train_1y) <- c("RF", "XGBoost", "PCR")
+
+# Actual 1-year returns
+y_train_1y <- train_combined$actual_1y
+```
+
+### Step 3.3.2: Set Up Constraints for 1Y
+
+```r
+# Same constraints
+E <- matrix(1, nrow = 1, ncol = n_models)
+f <- 1
+G <- diag(n_models)
+h <- rep(0, n_models)
+```
+
+### Step 3.3.3: Solve LSEI for 1Y Weights
+
+```r
+# Minimize ||X*weights - y||^2 for 1-year horizon
+lsei_1y <- lsei(A = X_train_1y, B = y_train_1y, E = E, F = f, G = G, H = h)
+
+weights_1y <- lsei_1y$X
+names(weights_1y) <- c("RF", "XGBoost", "PCR")
+
+cat("1Y Ensemble Weights:\n")
+print(weights_1y)
+```
+
+### Step 3.3.4: Evaluate 1Y In-Sample Performance
+
+```r
+ensemble_pred_1y_train <- as.vector(X_train_1y %*% weights_1y)
+
+rmse_1y_train <- sqrt(mean((y_train_1y - ensemble_pred_1y_train)^2))
+mae_1y_train <- mean(abs(y_train_1y - ensemble_pred_1y_train))
+r2_1y_train <- cor(y_train_1y, ensemble_pred_1y_train)^2
+
+cat("1Y In-Sample Performance:\n")
+cat("  RMSE:", rmse_1y_train, "\n")
+cat("  MAE :", mae_1y_train, "\n")
+cat("  R²  :", r2_1y_train, "\n")
+```
+
+---
+
+# PART 4: COMPARE WEIGHTS ACROSS HORIZONS
+
+```r
+cat("\n=== WEIGHT COMPARISON ACROSS HORIZONS ===\n")
+
+weights_comparison <- data.frame(
+  Model = c("RF", "XGBoost", "PCR"),
+  Weight_1Q = weights_1q,
+  Weight_6M = weights_6m,
+  Weight_1Y = weights_1y
+)
+
+print(weights_comparison)
+
+# Visualize
+library(tidyr)
+weights_long <- weights_comparison %>%
+  pivot_longer(cols = starts_with("Weight_"), 
+               names_to = "Horizon", 
+               values_to = "Weight") %>%
+  mutate(Horizon = gsub("Weight_", "", Horizon))
+
+ggplot(weights_long, aes(x = Model, y = Weight, fill = Horizon)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = sprintf("%.1f%%", Weight * 100)),
+            position = position_dodge(width = 0.9),
+            vjust = -0.5, size = 3) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Ensemble Weights by Forecasting Horizon",
+       subtitle = "Learned via LSEI on training data",
+       y = "Weight", fill = "Horizon") +
+  theme_minimal()
+```
+
+---
+
+# PART 5: APPLY TO TEST SET
+
+## Step 5.1: Load Test Predictions
+
+```r
+cat("\n=== LOADING TEST PREDICTIONS ===\n")
+
+# Load test data (same structure as training)
+rf_test <- read_csv("rf_test_predictions.csv") %>%
+  select(date, 
+         actual_1q, actual_6m, actual_1y,
+         rf_forecast_1q, rf_forecast_6m, rf_forecast_1y)
+
+xgb_test <- read_csv("xgb_test_predictions.csv") %>%
+  select(date,
+         xgb_forecast_1q, xgb_forecast_6m, xgb_forecast_1y)
+
+pcr_test <- read_csv("pcr_test_predictions.csv") %>%
+  select(date,
+         pcr_forecast_1q, pcr_forecast_6m, pcr_forecast_1y)
+
+# Combine
+test_combined <- rf_test %>%
+  left_join(xgb_test, by = "date") %>%
+  left_join(pcr_test, by = "date")
+```
+
+## Step 5.2: Generate Ensemble Predictions (All Horizons)
+
+```r
+cat("\n=== GENERATING ENSEMBLE TEST PREDICTIONS ===\n")
+
+# ===== 1-QUARTER ENSEMBLE PREDICTIONS =====
+X_test_1q <- test_combined %>%
+  select(rf_forecast_1q, xgb_forecast_1q, pcr_forecast_1q) %>%
+  as.matrix()
+
+ensemble_pred_1q_test <- as.vector(X_test_1q %*% weights_1q)
+
+# ===== 6-MONTH ENSEMBLE PREDICTIONS =====
+X_test_6m <- test_combined %>%
+  select(rf_forecast_6m, xgb_forecast_6m, pcr_forecast_6m) %>%
+  as.matrix()
+
+ensemble_pred_6m_test <- as.vector(X_test_6m %*% weights_6m)
+
+# ===== 1-YEAR ENSEMBLE PREDICTIONS =====
+X_test_1y <- test_combined %>%
+  select(rf_forecast_1y, xgb_forecast_1y, pcr_forecast_1y) %>%
+  as.matrix()
+
+ensemble_pred_1y_test <- as.vector(X_test_1y %*% weights_1y)
+
+# Add to test dataframe
+test_combined$ensemble_forecast_1q <- ensemble_pred_1q_test
+test_combined$ensemble_forecast_6m <- ensemble_pred_6m_test
+test_combined$ensemble_forecast_1y <- ensemble_pred_1y_test
+```
+
+## Step 5.3: Evaluate Out-of-Sample Performance
+
+```r
+cat("\n=== OUT-OF-SAMPLE PERFORMANCE ===\n\n")
+
+# ===== 1Q HORIZON =====
+rmse_1q_test <- sqrt(mean((test_combined$actual_1q - ensemble_pred_1q_test)^2))
+mae_1q_test <- mean(abs(test_combined$actual_1q - ensemble_pred_1q_test))
+r2_1q_test <- cor(test_combined$actual_1q, ensemble_pred_1q_test)^2
+
+cat("1-Quarter Horizon:\n")
+cat("  RMSE:", rmse_1q_test, "\n")
+cat("  MAE :", mae_1q_test, "\n")
+cat("  R²  :", r2_1q_test, "\n\n")
+
+# ===== 6M HORIZON =====
+rmse_6m_test <- sqrt(mean((test_combined$actual_6m - ensemble_pred_6m_test)^2))
+mae_6m_test <- mean(abs(test_combined$actual_6m - ensemble_pred_6m_test))
+r2_6m_test <- cor(test_combined$actual_6m, ensemble_pred_6m_test)^2
+
+cat("6-Month Horizon:\n")
+cat("  RMSE:", rmse_6m_test, "\n")
+cat("  MAE :", mae_6m_test, "\n")
+cat("  R²  :", r2_6m_test, "\n\n")
+
+# ===== 1Y HORIZON =====
+rmse_1y_test <- sqrt(mean((test_combined$actual_1y - ensemble_pred_1y_test)^2))
+mae_1y_test <- mean(abs(test_combined$actual_1y - ensemble_pred_1y_test))
+r2_1y_test <- cor(test_combined$actual_1y, ensemble_pred_1y_test)^2
+
+cat("1-Year Horizon:\n")
+cat("  RMSE:", rmse_1y_test, "\n")
+cat("  MAE :", mae_1y_test, "\n")
+cat("  R²  :", r2_1y_test, "\n\n")
+```
+
+---
+
+# PART 6: SAVE OUTPUTS
+
+## Step 6.1: Save Multi-Horizon Ensemble Predictions
+
+```r
+cat("\n=== SAVING ENSEMBLE PREDICTIONS ===\n")
+
+# Save test predictions with all 3 horizons
+ensemble_output <- test_combined %>%
+  select(date, 
+         actual_1q, actual_6m, actual_1y,
+         ensemble_forecast_1q, 
+         ensemble_forecast_6m, 
+         ensemble_forecast_1y)
+
+write_csv(ensemble_output, "../data/ensemble_predictions_multihorizon.csv")
+
+cat("✓ Saved: ensemble_predictions_multihorizon.csv\n")
+cat("  Columns: date, actual_*, ensemble_forecast_* (for 1q, 6m, 1y)\n\n")
+```
+
+## Step 6.2: Save Ensemble Weights
+
+```r
+# Save weights for each horizon
+weights_all <- data.frame(
+  Model = c("RF", "XGBoost", "PCR"),
+  Weight_1Q = weights_1q,
+  Weight_6M = weights_6m,
+  Weight_1Y = weights_1y,
+  Pct_1Q = weights_1q * 100,
+  Pct_6M = weights_6m * 100,
+  Pct_1Y = weights_1y * 100
+)
+
+write_csv(weights_all, "../data/ensemble_weights_multihorizon.csv")
+
+cat("✓ Saved: ensemble_weights_multihorizon.csv\n\n")
+```
+
+## Step 6.3: Save Performance Summary
+
+```r
+# Create performance summary table
+performance_summary <- data.frame(
+  Horizon = c("1-Quarter", "6-Month", "1-Year"),
+  Train_RMSE = c(rmse_1q_train, rmse_6m_train, rmse_1y_train),
+  Train_MAE = c(mae_1q_train, mae_6m_train, mae_1y_train),
+  Train_R2 = c(r2_1q_train, r2_6m_train, r2_1y_train),
+  Test_RMSE = c(rmse_1q_test, rmse_6m_test, rmse_1y_test),
+  Test_MAE = c(mae_1q_test, mae_6m_test, mae_1y_test),
+  Test_R2 = c(r2_1q_test, r2_6m_test, r2_1y_test)
+)
+
+write_csv(performance_summary, "../data/ensemble_performance_summary.csv")
+
+cat("✓ Saved: ensemble_performance_summary.csv\n\n")
+```
+
+---
+
+# PART 7: USAGE IN STRATEGY BACKTEST
+
+```r
+# In strategy_backtest.Rmd, you would load:
+
+ensemble_forecasts <- read_csv("../data/ensemble_predictions_multihorizon.csv")
+
+# Then use:
+# - ensemble_forecast_1q for quarterly rebalancing strategy
+# - ensemble_forecast_6m for semi-annual rebalancing strategy
+# - ensemble_forecast_1y for annual rebalancing strategy
+
+# Example:
+tactical_strategy_quarterly <- function(data) {
+  data %>%
+    mutate(position = ifelse(ensemble_forecast_1q > tbill_rate_3m, 
+                             "SP500", "TBILL"))
+}
+
+tactical_strategy_semiannual <- function(data) {
+  data %>%
+    mutate(position = ifelse(ensemble_forecast_6m > tbill_rate_6m, 
+                             "SP500", "TBILL"))
+}
+
+tactical_strategy_annual <- function(data) {
+  data %>%
+    mutate(position = ifelse(ensemble_forecast_1y > tbill_rate_1y, 
+                             "SP500", "TBILL"))
+}
+```
+
+---
+
+# COMPLETE WORKFLOW SUMMARY
+
+```
+1. DATA LOADING
+   ├── Load RF predictions (1q, 6m, 1y)
+   ├── Load XGBoost predictions (1q, 6m, 1y)
+   └── Load PCR predictions (1q, 6m, 1y)
+
+2. TRAINING (3 SEPARATE ENSEMBLES)
+   ├── ENSEMBLE 1: Learn weights for 1Q forecasts
+   │   ├── Prepare X_train_1q matrix (RF, XGB, PCR forecasts)
+   │   ├── Set up constraints (sum=1, all>=0)
+   │   ├── Solve LSEI → weights_1q
+   │   └── Evaluate in-sample performance
+   │
+   ├── ENSEMBLE 2: Learn weights for 6M forecasts
+   │   ├── Prepare X_train_6m matrix
+   │   ├── Set up constraints
+   │   ├── Solve LSEI → weights_6m
+   │   └── Evaluate in-sample performance
+   │
+   └── ENSEMBLE 3: Learn weights for 1Y forecasts
+       ├── Prepare X_train_1y matrix
+       ├── Set up constraints
+       ├── Solve LSEI → weights_1y
+       └── Evaluate in-sample performance
+
+3. TESTING (APPLY 3 ENSEMBLES)
+   ├── Load test predictions (1q, 6m, 1y from each model)
+   ├── Apply weights_1q to get ensemble_forecast_1q
+   ├── Apply weights_6m to get ensemble_forecast_6m
+   ├── Apply weights_1y to get ensemble_forecast_1y
+   └── Evaluate out-of-sample performance
+
+4. SAVE OUTPUTS
+   ├── ensemble_predictions_multihorizon.csv
+   ├── ensemble_weights_multihorizon.csv
+   └── ensemble_performance_summary.csv
+
+5. USE IN BACKTESTING
+   ├── Quarterly strategy uses ensemble_forecast_1q
+   ├── Semi-annual strategy uses ensemble_forecast_6m
+   └── Annual strategy uses ensemble_forecast_1y
+```
+
+---
+
+# KEY INSIGHTS
+
+1. **Different Weights Per Horizon**: Each horizon gets its own set of weights
+   - Example: XGBoost might get 80% weight for 1Q, but only 40% for 1Y
+   - This reflects different model strengths at different time scales
+
+2. **Independent Optimization**: Each ensemble is learned independently
+   - 1Q ensemble minimizes 1Q forecast errors
+   - 6M ensemble minimizes 6M forecast errors
+   - 1Y ensemble minimizes 1Y forecast errors
+
+3. **Alignment with Strategies**: 
+   - Quarterly rebalancing uses 1Q ensemble
+   - Semi-annual rebalancing uses 6M ensemble
+   - Annual rebalancing uses 1Y ensemble
+   
+4. **Data Requirements**: Need multi-horizon predictions from ALL base models
+   - If a model only provides 1Q forecasts, it can't be included in 6M/1Y ensembles
+   - All models must provide all 3 horizons for this to work
+
+---
+
+# NEXT STEP: SHOW ME YOUR DATA FORMAT
+
+Please share:
+1. Column names in your actual prediction files
+2. Any naming conventions that differ from this draft
+3. Whether you have all 3 horizons ready or need to generate them first
+
+Then I'll update the actual ensemble_lsei.Rmd file with correct column names!

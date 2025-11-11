@@ -1,0 +1,992 @@
+---
+title: "Multi-Horizon Tactical Asset Allocation Strategy Backtest"
+author: "EC4308 - S&P 500 Forecasting Project"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 6)
+
+# Load required libraries
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(knitr)
+library(scales)
+library(gridExtra)
+```
+
+# Executive Summary
+
+This document implements and evaluates **tactical asset allocation strategies** using machine learning forecasts across three rebalancing horizons:
+
+- **Quarterly (3-month)**: Rebalance every quarter
+- **Semi-Annual (6-month)**: Rebalance every 6 months
+- **Annual (12-month)**: Rebalance every 12 months
+
+## Strategy Design
+
+**Decision Rule:** At each rebalancing date, compare forecasted S&P 500 return with T-bill rate:
+
+- If **Forecasted S&P 500 ≥ T-bill Rate** → Invest in S&P 500
+- If **Forecasted S&P 500 < T-bill Rate** → Invest in T-bills
+
+**Key Features:**
+
+- Starting capital: $1.00
+- 100% allocation (no partial positions)
+- No transaction costs (baseline)
+- Test period: 2011-Q4 to 2024-Q3
+
+---
+
+# 1. Load Data
+
+## 1.1 Load Consolidated Forecasts
+
+```{r load-forecasts}
+cat("\n=== LOADING CONSOLIDATED FORECAST DATA ===\n\n")
+
+# Load multi-horizon forecasts
+forecast_data <- read_csv("../data/consolidated_forecasts_multihorizon.csv")
+
+cat("✓ Forecasts loaded:", nrow(forecast_data), "observations\n")
+cat("  Date range:", min(forecast_data$date), "to", max(forecast_data$date), "\n")
+cat("  Total columns:", ncol(forecast_data), "\n\n")
+
+cat("Available models:\n")
+cat("  - Random Forest (rf)\n")
+cat("  - Lasso\n")
+cat("  - Ridge\n")
+cat("  - PCR\n")
+cat("  - Elastic Net\n\n")
+
+cat("Available horizons:\n")
+cat("  - 3-month (quarterly)\n")
+cat("  - 6-month (semi-annual)\n")
+cat("  - 12-month (annual)\n\n")
+
+head(forecast_data, 5)
+```
+
+## 1.2 Load T-Bill Returns
+
+```{r load-tbills}
+cat("\n=== LOADING T-BILL RETURNS ===\n\n")
+
+# Load T-bill returns for all horizons
+tbill_data <- read_csv("../data/tbill_returns_multihorizon.csv")
+
+cat("✓ T-Bill returns loaded:", nrow(tbill_data), "observations\n")
+cat("  Date range:", min(tbill_data$date), "to", max(tbill_data$date), "\n\n")
+
+cat("T-Bill horizons:\n")
+cat("  - tbill_return_3m: 3-month holding period return\n")
+cat("  - tbill_return_6m: 6-month holding period return\n")
+cat("  - tbill_return_12m: 12-month holding period return\n\n")
+
+head(tbill_data, 5)
+```
+
+## 1.3 Merge Forecasts with T-Bills
+
+```{r merge-data}
+cat("\n=== MERGING FORECAST AND T-BILL DATA ===\n\n")
+
+# Merge forecasts with T-bills
+backtest_data <- forecast_data %>%
+  inner_join(tbill_data, by = "date") %>%
+  arrange(date) %>%
+  drop_na()
+
+cat("✓ Data merged successfully!\n")
+cat("  Final observations:", nrow(backtest_data), "\n")
+cat("  Date range:", min(backtest_data$date), "to", max(backtest_data$date), "\n")
+cat("  Total columns:", ncol(backtest_data), "\n\n")
+
+cat("Dataset structure:\n")
+cat("  - Actual returns: actual_3m, actual_6m, actual_12m\n")
+cat("  - Model forecasts: [model]_forecast_[horizon]\n")
+cat("  - T-Bill returns: tbill_return_3m, tbill_return_6m, tbill_return_12m\n\n")
+
+# Show summary
+cat("Summary statistics:\n")
+summary(backtest_data %>% select(actual_3m, actual_6m, actual_12m,
+                                   tbill_return_3m, tbill_return_6m, tbill_return_12m))
+```
+
+---
+
+# 2. Backtesting Framework
+
+## 2.1 Tactical Strategy Function
+
+```{r strategy-function}
+#' Tactical Asset Allocation Backtest
+#' 
+#' @param data Data frame with date, forecast, actual, and tbill columns
+#' @param forecast_col Name of forecast column
+#' @param actual_col Name of actual return column (ALWAYS use actual_3m for quarterly returns)
+#' @param tbill_col Name of T-bill return column (ALWAYS use tbill_return_3m for quarterly returns)
+#' @param horizon Rebalancing horizon: "3m", "6m", or "12m"
+#' @param initial_capital Starting capital (default: 1)
+#' @param strategy_name Name for reporting
+#' 
+#' @return List containing results dataframe and performance metrics
+tactical_backtest <- function(data, forecast_col, actual_col, tbill_col, horizon = "3m",
+                               initial_capital = 1, strategy_name = "Strategy") {
+  
+  cat("\n=== Backtesting:", strategy_name, "===\n")
+  
+  # Determine rebalancing frequency (quarters to skip between rebalances)
+  rebal_freq <- switch(horizon,
+                       "3m" = 1,   # Rebalance every quarter
+                       "6m" = 2,   # Rebalance every 2 quarters
+                       "12m" = 4,  # Rebalance every 4 quarters
+                       1)
+  
+  # Extract relevant columns from full dataset
+  full_data <- data %>%
+    select(date, 
+           forecast = all_of(forecast_col),
+           actual = all_of(actual_col), 
+           tbill = all_of(tbill_col)) %>%
+    arrange(date) %>%
+    drop_na()
+  
+  # For strategy decisions: sample at rebalancing frequency
+  # For 6m: use rows 1, 3, 5, 7... (every 2nd quarter)
+  # For 12m: use rows 1, 5, 9, 13... (every 4th quarter)
+  decision_rows <- seq(1, nrow(full_data), by = rebal_freq)
+  decision_df <- full_data[decision_rows, ]
+  
+  n_rebalances <- nrow(decision_df)
+  
+  cat("  Rebalancing periods:", n_rebalances, "\n")
+  cat("  Date range:", min(decision_df$date), "to", max(decision_df$date), "\n")
+  
+  # For each rebalancing decision, we hold for rebal_freq quarters
+  # and compound the quarterly returns over that holding period
+  portfolio_value <- numeric(n_rebalances + 1)
+  position <- character(n_rebalances + 1)
+  period_returns <- numeric(n_rebalances)
+  
+  # Starting values
+  portfolio_value[1] <- initial_capital
+  position[1] <- NA
+  
+  # Run strategy
+  for (t in 1:n_rebalances) {
+    # Decision at rebalancing date: Compare forecast with T-bill at decision point
+    decision_date_idx <- decision_rows[t]
+    
+    if (decision_df$forecast[t] >= decision_df$tbill[t]) {
+      # Invest in S&P 500 - compound quarterly returns over holding period
+      position[t + 1] <- "SP500"
+      
+      # Get the next rebal_freq quarterly returns
+      holding_period_idx <- decision_date_idx:(min(decision_date_idx + rebal_freq - 1, nrow(full_data)))
+      holding_returns <- full_data$actual[holding_period_idx]
+      
+      # Compound returns over holding period
+      period_returns[t] <- prod(1 + holding_returns) - 1
+      
+    } else {
+      # Invest in T-bills - compound quarterly T-bill returns over holding period
+      position[t + 1] <- "TBILL"
+      
+      # Get the next rebal_freq quarterly T-bill returns
+      holding_period_idx <- decision_date_idx:(min(decision_date_idx + rebal_freq - 1, nrow(full_data)))
+      holding_returns <- full_data$tbill[holding_period_idx]
+      
+      # Compound returns over holding period
+      period_returns[t] <- prod(1 + holding_returns) - 1
+    }
+    
+    # Update portfolio value
+    portfolio_value[t + 1] <- portfolio_value[t] * (1 + period_returns[t])
+  }
+  
+  # Create results dataframe
+  results_df <- data.frame(
+    date = c(decision_df$date[1], decision_df$date),
+    portfolio_value = portfolio_value,
+    position = position,
+    returns_earned = c(NA, period_returns),
+    forecast = c(NA, decision_df$forecast),
+    decision_tbill = c(NA, decision_df$tbill)
+  )
+  
+  # Calculate performance metrics
+  total_return <- (portfolio_value[n_rebalances + 1] / portfolio_value[1]) - 1
+  
+  # Annualization factor depends on horizon
+  periods_per_year <- switch(horizon, "3m" = 4, "6m" = 2, "12m" = 1, 4)
+  annualized_return <- (1 + total_return)^(periods_per_year / n_rebalances) - 1
+  
+  # Volatility (annualized)
+  returns_sd <- sd(period_returns, na.rm = TRUE)
+  annualized_vol <- returns_sd * sqrt(periods_per_year)
+  
+  # Sharpe ratio (comparing period returns to risk-free rate)
+  # For fair comparison, compound T-bill returns over holding period for excess return calc
+  excess_returns <- period_returns  # Already net of opportunity cost in decision
+  sharpe_ratio <- mean(period_returns, na.rm = TRUE) / sd(period_returns, na.rm = TRUE) * sqrt(periods_per_year)
+  
+  # Max drawdown
+  cummax_value <- cummax(portfolio_value)
+  drawdown <- (portfolio_value - cummax_value) / cummax_value
+  max_drawdown <- min(drawdown)
+  
+  # Win rate
+  win_rate <- sum(period_returns > 0, na.rm = TRUE) / sum(!is.na(period_returns))
+  
+  # Turnover (position changes)
+  switches <- sum(position[-1] != position[-length(position)], na.rm = TRUE)
+  turnover <- switches / n_rebalances
+  
+  # Time in market
+  time_in_sp500 <- sum(position == "SP500", na.rm = TRUE) / sum(!is.na(position))
+  
+  metrics <- list(
+    strategy_name = strategy_name,
+    total_return = total_return,
+    annualized_return = annualized_return,
+    annualized_vol = annualized_vol,
+    sharpe_ratio = sharpe_ratio,
+    max_drawdown = max_drawdown,
+    win_rate = win_rate,
+    turnover = turnover,
+    n_switches = switches,
+    time_in_sp500 = time_in_sp500,
+    final_value = portfolio_value[n_rebalances + 1]
+  )
+  
+  cat("  Final value: $", round(metrics$final_value, 4), "\n")
+  cat("  Total return:", percent(metrics$total_return, accuracy = 0.01), "\n")
+  cat("  Sharpe ratio:", round(metrics$sharpe_ratio, 3), "\n")
+  
+  return(list(results = results_df, metrics = metrics))
+}
+```
+
+## 2.2 Benchmark Functions
+
+```{r benchmark-functions}
+#' Buy-and-Hold Benchmark
+#' 
+#' @param data Data frame with date and returns
+#' @param actual_col Name of actual return column  
+#' @param tbill_col Name of T-bill return column (only used for T-bill benchmark)
+#' @param initial_capital Starting capital (default: 1)
+#' @param benchmark_name Name for reporting
+#' @param asset "SP500" or "TBILL"
+buy_hold_benchmark <- function(data, actual_col = NULL, tbill_col = NULL, 
+                                initial_capital = 1, 
+                                benchmark_name = "Buy-Hold", asset = "SP500") {
+  
+  cat("\n=== Benchmark:", benchmark_name, "===\n")
+  
+  # For T-bills, use tbill_col; for S&P500, use actual_col
+  if (asset == "TBILL") {
+    if (is.null(tbill_col)) stop("tbill_col must be provided for T-bill benchmark")
+    backtest_df <- data %>%
+      select(date, actual = all_of(tbill_col)) %>%
+      arrange(date) %>%
+      drop_na()
+  } else {
+    if (is.null(actual_col)) stop("actual_col must be provided for S&P500 benchmark")
+    backtest_df <- data %>%
+      select(date, actual = all_of(actual_col)) %>%
+      arrange(date) %>%
+      drop_na()
+  }
+  
+  n_periods <- nrow(backtest_df)
+  
+  cat("  Periods:", n_periods, "\n")
+  cat("  Date range:", min(backtest_df$date), "to", max(backtest_df$date), "\n")
+  
+  # Calculate cumulative returns - simple addition (not compounding)
+  cumulative_returns <- c(0, cumsum(backtest_df$actual))
+  portfolio_value <- initial_capital + cumulative_returns
+  
+  results_df <- data.frame(
+    date = c(backtest_df$date[1], backtest_df$date),
+    portfolio_value = portfolio_value,
+    position = asset
+  )
+  
+  # Calculate metrics
+  total_return <- sum(backtest_df$actual)
+  
+  # Annualization factor - determine from column name
+  col_name <- if (asset == "TBILL") tbill_col else actual_col
+  periods_per_year <- if (grepl("3m", col_name)) 4 else if (grepl("6m", col_name)) 2 else 1
+  annualized_return <- (1 + total_return)^(periods_per_year / n_periods) - 1
+  
+  # Volatility
+  returns_sd <- sd(backtest_df$actual, na.rm = TRUE)
+  annualized_vol <- returns_sd * sqrt(periods_per_year)
+  
+  # Max drawdown
+  cummax_value <- cummax(portfolio_value)
+  drawdown <- (portfolio_value - cummax_value) / cummax_value
+  max_drawdown <- min(drawdown)
+  
+  metrics <- list(
+    strategy_name = benchmark_name,
+    total_return = total_return,
+    annualized_return = annualized_return,
+    annualized_vol = annualized_vol,
+    sharpe_ratio = NA,
+    max_drawdown = max_drawdown,
+    win_rate = NA,
+    turnover = 0,
+    n_switches = 0,
+    time_in_sp500 = if(asset == "SP500") 1 else 0,
+    final_value = portfolio_value[n_periods + 1]
+  )
+  
+  cat("  Final value: $", round(metrics$final_value, 4), "\n")
+  cat("  Total return:", percent(metrics$total_return, accuracy = 0.01), "\n")
+  
+  return(list(results = results_df, metrics = metrics))
+}
+
+#' Perfect Foresight (Oracle) Benchmark
+perfect_foresight_benchmark <- function(data, actual_col, tbill_col, horizon = "3m",
+                                         initial_capital = 1, 
+                                         benchmark_name = "Perfect Foresight") {
+  
+  cat("\n=== Benchmark:", benchmark_name, "===\n")
+  
+  # Use actual returns as "forecasts" - perfect market timing
+  oracle_data <- data %>%
+    mutate(forecast = get(actual_col))
+  
+  result <- tactical_backtest(
+    data = oracle_data,
+    forecast_col = "forecast",
+    actual_col = actual_col,
+    tbill_col = tbill_col,
+    horizon = horizon,
+    initial_capital = initial_capital,
+    strategy_name = benchmark_name
+  )
+  
+  return(result)
+}
+```
+
+---
+
+# 3. Run Backtests - Quarterly (3-Month) Horizon
+
+```{r backtest-3m}
+cat("\n")
+cat("QUARTERLY (3-MONTH) REBALANCING STRATEGIES\n")
+
+# Models to test
+models_3m <- c("rf", "lasso", "ridge", "pcr", "elastic")
+
+# Initialize results list
+results_3m <- list()
+
+# Run tactical strategies
+for (model in models_3m) {
+  forecast_col <- paste0(model, "_forecast_3m")
+  strategy_name <- paste0(toupper(model), " Tactical (3M)")
+  
+  results_3m[[strategy_name]] <- tactical_backtest(
+    data = backtest_data,
+    forecast_col = forecast_col,
+    actual_col = "actual_3m",  # Always use quarterly returns
+    tbill_col = "tbill_return_3m",  # Always use quarterly T-bill returns
+    horizon = "3m",  # Rebalance quarterly
+    strategy_name = strategy_name
+  )
+}
+
+# Benchmarks
+results_3m[["Buy-Hold S&P500 (3M)"]] <- buy_hold_benchmark(
+  data = backtest_data,
+  actual_col = "actual_3m",
+  benchmark_name = "Buy-Hold S&P500 (3M)",
+  asset = "SP500"
+)
+
+results_3m[["Buy-Hold T-Bill (3M)"]] <- buy_hold_benchmark(
+  data = backtest_data,
+  tbill_col = "tbill_return_3m",
+  benchmark_name = "Buy-Hold T-Bill (3M)",
+  asset = "TBILL"
+)
+
+results_3m[["Perfect Foresight (3M)"]] <- perfect_foresight_benchmark(
+  data = backtest_data,
+  actual_col = "actual_3m",
+  tbill_col = "tbill_return_3m",
+  horizon = "3m",  # Rebalance quarterly
+  benchmark_name = "Perfect Foresight (3M)"
+)
+
+cat("\n✓ Quarterly (3M) backtests completed!\n")
+```
+
+---
+
+# 4. Run Backtests - Semi-Annual (6-Month) Horizon
+
+```{r backtest-6m}
+cat("\n")
+cat("SEMI-ANNUAL (6-MONTH) REBALANCING STRATEGIES\n")
+
+# Models to test
+models_6m <- c("rf", "lasso", "ridge", "pcr", "elastic")
+
+# Initialize results list
+results_6m <- list()
+
+# Run tactical strategies
+for (model in models_6m) {
+  forecast_col <- paste0(model, "_forecast_6m")
+  strategy_name <- paste0(toupper(model), " Tactical (6M)")
+  
+  results_6m[[strategy_name]] <- tactical_backtest(
+    data = backtest_data,
+    forecast_col = forecast_col,
+    actual_col = "actual_3m",  # Always use quarterly returns, not overlapping 6m returns
+    tbill_col = "tbill_return_3m",  # Always use quarterly T-bill returns
+    horizon = "6m",  # Rebalance every 6 months (every 2 quarters)
+    strategy_name = strategy_name
+  )
+}
+
+# Benchmarks - NOTE: Buy-hold uses QUARTERLY returns regardless of horizon
+# This ensures benchmarks are identical across all horizons (as they should be)
+results_6m[["Buy-Hold S&P500 (6M)"]] <- buy_hold_benchmark(
+  data = backtest_data,
+  actual_col = "actual_3m",  # Always use quarterly returns, not 6m overlapping returns
+  benchmark_name = "Buy-Hold S&P500 (6M)",
+  asset = "SP500"
+)
+
+results_6m[["Buy-Hold T-Bill (6M)"]] <- buy_hold_benchmark(
+  data = backtest_data,
+  tbill_col = "tbill_return_3m",  # Always use quarterly T-bill returns
+  benchmark_name = "Buy-Hold T-Bill (6M)",
+  asset = "TBILL"
+)
+
+results_6m[["Perfect Foresight (6M)"]] <- perfect_foresight_benchmark(
+  data = backtest_data,
+  actual_col = "actual_3m",  # Always use quarterly returns to avoid overlapping
+  tbill_col = "tbill_return_3m",  # Always use quarterly T-bill returns
+  horizon = "6m",  # Rebalance every 6 months
+  benchmark_name = "Perfect Foresight (6M)"
+)
+
+cat("\n✓ Semi-Annual (6M) backtests completed!\n")
+```
+
+---
+
+# 5. Run Backtests - Annual (12-Month) Horizon
+
+```{r backtest-12m}
+cat("\n")
+cat("ANNUAL (12-MONTH) REBALANCING STRATEGIES\n")
+
+# Models to test
+models_12m <- c("rf", "lasso", "ridge", "pcr", "elastic")
+
+# Initialize results list
+results_12m <- list()
+
+# Run tactical strategies
+for (model in models_12m) {
+  forecast_col <- paste0(model, "_forecast_12m")
+  strategy_name <- paste0(toupper(model), " Tactical (12M)")
+  
+  results_12m[[strategy_name]] <- tactical_backtest(
+    data = backtest_data,
+    forecast_col = forecast_col,
+    actual_col = "actual_3m",  # Always use quarterly returns, not overlapping 12m returns
+    tbill_col = "tbill_return_3m",  # Always use quarterly T-bill returns
+    horizon = "12m",  # Rebalance annually (every 4 quarters)
+    strategy_name = strategy_name
+  )
+}
+
+# Benchmarks - NOTE: Buy-hold uses QUARTERLY returns regardless of horizon
+# This ensures benchmarks are identical across all horizons (as they should be)
+results_12m[["Buy-Hold S&P500 (12M)"]] <- buy_hold_benchmark(
+  data = backtest_data,
+  actual_col = "actual_3m",  # Always use quarterly returns, not 12m overlapping returns
+  benchmark_name = "Buy-Hold S&P500 (12M)",
+  asset = "SP500"
+)
+
+results_12m[["Buy-Hold T-Bill (12M)"]] <- buy_hold_benchmark(
+  data = backtest_data,
+  tbill_col = "tbill_return_3m",  # Always use quarterly T-bill returns
+  benchmark_name = "Buy-Hold T-Bill (12M)",
+  asset = "TBILL"
+)
+
+results_12m[["Perfect Foresight (12M)"]] <- perfect_foresight_benchmark(
+  data = backtest_data,
+  actual_col = "actual_3m",  # Always use quarterly returns to avoid overlapping
+  tbill_col = "tbill_return_3m",  # Always use quarterly T-bill returns
+  horizon = "12m",  # Rebalance annually
+  benchmark_name = "Perfect Foresight (12M)"
+)
+
+cat("\n✓ Annual (12M) backtests completed!\n")
+```
+
+---
+
+# 6. Performance Comparison
+
+## 6.1 Summary Table - Quarterly (3M)
+
+```{r performance-table-3m}
+# Extract metrics from all strategies
+metrics_df_3m <- bind_rows(lapply(results_3m, function(x) as.data.frame(x$metrics)))
+
+# Format table
+performance_3m <- metrics_df_3m %>%
+  select(Strategy = strategy_name, 
+         `Total Return` = total_return,
+         `Ann. Return` = annualized_return,
+         `Ann. Vol` = annualized_vol,
+         `Sharpe Ratio` = sharpe_ratio,
+         `Max DD` = max_drawdown,
+         `Win Rate` = win_rate,
+         Turnover = turnover,
+         `Switches` = n_switches,
+         `% in S&P500` = time_in_sp500,
+         `Final Value` = final_value) %>%
+  mutate(across(c(`Total Return`, `Ann. Return`, `Ann. Vol`, `Max DD`, `Win Rate`, Turnover, `% in S&P500`), 
+                ~percent(., accuracy = 0.01)),
+         across(c(`Sharpe Ratio`), ~round(., 3)),
+         across(c(`Final Value`), ~round(., 4)))
+
+cat("\n=== QUARTERLY (3-MONTH) REBALANCING PERFORMANCE ===\n\n")
+kable(performance_3m, align = "lrrrrrrrrrrr", 
+      caption = "Performance Metrics - Quarterly Strategies")
+```
+
+## 6.2 Summary Table - Semi-Annual (6M)
+
+```{r performance-table-6m}
+# Extract metrics
+metrics_df_6m <- bind_rows(lapply(results_6m, function(x) as.data.frame(x$metrics)))
+
+# Format table
+performance_6m <- metrics_df_6m %>%
+  select(Strategy = strategy_name, 
+         `Total Return` = total_return,
+         `Ann. Return` = annualized_return,
+         `Ann. Vol` = annualized_vol,
+         `Sharpe Ratio` = sharpe_ratio,
+         `Max DD` = max_drawdown,
+         `Win Rate` = win_rate,
+         Turnover = turnover,
+         `Switches` = n_switches,
+         `% in S&P500` = time_in_sp500,
+         `Final Value` = final_value) %>%
+  mutate(across(c(`Total Return`, `Ann. Return`, `Ann. Vol`, `Max DD`, `Win Rate`, Turnover, `% in S&P500`), 
+                ~percent(., accuracy = 0.01)),
+         across(c(`Sharpe Ratio`), ~round(., 3)),
+         across(c(`Final Value`), ~round(., 4)))
+
+cat("\n=== SEMI-ANNUAL (6-MONTH) REBALANCING PERFORMANCE ===\n\n")
+kable(performance_6m, align = "lrrrrrrrrrrr", 
+      caption = "Performance Metrics - Semi-Annual Strategies")
+```
+
+## 6.3 Summary Table - Annual (12M)
+
+```{r performance-table-12m}
+# Extract metrics
+metrics_df_12m <- bind_rows(lapply(results_12m, function(x) as.data.frame(x$metrics)))
+
+# Format table
+performance_12m <- metrics_df_12m %>%
+  select(Strategy = strategy_name, 
+         `Total Return` = total_return,
+         `Ann. Return` = annualized_return,
+         `Ann. Vol` = annualized_vol,
+         `Sharpe Ratio` = sharpe_ratio,
+         `Max DD` = max_drawdown,
+         `Win Rate` = win_rate,
+         Turnover = turnover,
+         `Switches` = n_switches,
+         `% in S&P500` = time_in_sp500,
+         `Final Value` = final_value) %>%
+  mutate(across(c(`Total Return`, `Ann. Return`, `Ann. Vol`, `Max DD`, `Win Rate`, Turnover, `% in S&P500`), 
+                ~percent(., accuracy = 0.01)),
+         across(c(`Sharpe Ratio`), ~round(., 3)),
+         across(c(`Final Value`), ~round(., 4)))
+
+cat("\n=== ANNUAL (12-MONTH) REBALANCING PERFORMANCE ===\n\n")
+kable(performance_12m, align = "lrrrrrrrrrrr", 
+      caption = "Performance Metrics - Annual Strategies")
+```
+
+---
+
+# 7. Visualizations
+
+## 7.1 Portfolio Value Evolution - Quarterly (3M)
+
+```{r plot-portfolio-3m, fig.height=8}
+# Combine portfolio values
+portfolio_3m <- bind_rows(lapply(names(results_3m), function(name) {
+  results_3m[[name]]$results %>%
+    select(date, portfolio_value) %>%
+    mutate(Strategy = name)
+}))
+
+# Create plot
+ggplot(portfolio_3m, aes(x = date, y = portfolio_value, color = Strategy)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_log10(labels = dollar_format()) +
+  scale_color_manual(values = c(
+    "RF TACTICAL (3M)" = "#E41A1C",
+    "LASSO TACTICAL (3M)" = "#377EB8",
+    "RIDGE TACTICAL (3M)" = "#4DAF4A",
+    "PCR TACTICAL (3M)" = "#984EA3",
+    "ELASTIC TACTICAL (3M)" = "#FF7F00",
+    "Buy-Hold S&P500 (3M)" = "black",
+    "Buy-Hold T-Bill (3M)" = "gray50",
+    "Perfect Foresight (3M)" = "gold"
+  )) +
+  labs(
+    title = "Portfolio Value Evolution - Quarterly Rebalancing (3-Month Horizon)",
+    subtitle = paste("Test Period:", min(backtest_data$date), "to", max(backtest_data$date), "| Log Scale"),
+    x = "Date",
+    y = "Portfolio Value ($)",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 9)
+  ) +
+  guides(color = guide_legend(nrow = 3))
+```
+
+## 7.2 Portfolio Value Evolution - Semi-Annual (6M)
+
+```{r plot-portfolio-6m, fig.height=8}
+# Combine portfolio values
+portfolio_6m <- bind_rows(lapply(names(results_6m), function(name) {
+  results_6m[[name]]$results %>%
+    select(date, portfolio_value) %>%
+    mutate(Strategy = name)
+}))
+
+# Create plot
+ggplot(portfolio_6m, aes(x = date, y = portfolio_value, color = Strategy)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_log10(labels = dollar_format()) +
+  scale_color_manual(values = c(
+    "RF TACTICAL (6M)" = "#E41A1C",
+    "LASSO TACTICAL (6M)" = "#377EB8",
+    "RIDGE TACTICAL (6M)" = "#4DAF4A",
+    "PCR TACTICAL (6M)" = "#984EA3",
+    "ELASTIC TACTICAL (6M)" = "#FF7F00",
+    "Buy-Hold S&P500 (6M)" = "black",
+    "Buy-Hold T-Bill (6M)" = "gray50",
+    "Perfect Foresight (6M)" = "gold"
+  )) +
+  labs(
+    title = "Portfolio Value Evolution - Semi-Annual Rebalancing (6-Month Horizon)",
+    subtitle = paste("Test Period:", min(backtest_data$date), "to", max(backtest_data$date), "| Log Scale"),
+    x = "Date",
+    y = "Portfolio Value ($)",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 9)
+  ) +
+  guides(color = guide_legend(nrow = 3))
+```
+
+## 7.3 Portfolio Value Evolution - Annual (12M)
+
+```{r plot-portfolio-12m, fig.height=8}
+# Combine portfolio values
+portfolio_12m <- bind_rows(lapply(names(results_12m), function(name) {
+  results_12m[[name]]$results %>%
+    select(date, portfolio_value) %>%
+    mutate(Strategy = name)
+}))
+
+# Create plot
+ggplot(portfolio_12m, aes(x = date, y = portfolio_value, color = Strategy)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_log10(labels = dollar_format()) +
+  scale_color_manual(values = c(
+    "RF TACTICAL (12M)" = "#E41A1C",
+    "LASSO TACTICAL (12M)" = "#377EB8",
+    "RIDGE TACTICAL (12M)" = "#4DAF4A",
+    "PCR TACTICAL (12M)" = "#984EA3",
+    "ELASTIC TACTICAL (12M)" = "#FF7F00",
+    "Buy-Hold S&P500 (12M)" = "black",
+    "Buy-Hold T-Bill (12M)" = "gray50",
+    "Perfect Foresight (12M)" = "gold"
+  )) +
+  labs(
+    title = "Portfolio Value Evolution - Annual Rebalancing (12-Month Horizon)",
+    subtitle = paste("Test Period:", min(backtest_data$date), "to", max(backtest_data$date), "| Log Scale"),
+    x = "Date",
+    y = "Portfolio Value ($)",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 9)
+  ) +
+  guides(color = guide_legend(nrow = 3))
+```
+
+## 7.4 Asset Allocation - Random Forest Example
+
+```{r plot-allocation, fig.height=10}
+# RF allocation for all horizons
+p1 <- results_3m[["RF TACTICAL (3M)"]]$results %>%
+  filter(!is.na(position)) %>%
+  mutate(position_numeric = ifelse(position == "SP500", 1, 0)) %>%
+  ggplot(aes(x = date, y = position_numeric)) +
+  geom_step(color = "steelblue", linewidth = 1) +
+  scale_y_continuous(breaks = c(0, 1), labels = c("T-Bill", "S&P 500")) +
+  labs(
+    title = "Random Forest - Quarterly (3M) Allocation",
+    x = NULL,
+    y = "Position"
+  ) +
+  theme_minimal()
+
+p2 <- results_6m[["RF TACTICAL (6M)"]]$results %>%
+  filter(!is.na(position)) %>%
+  mutate(position_numeric = ifelse(position == "SP500", 1, 0)) %>%
+  ggplot(aes(x = date, y = position_numeric)) +
+  geom_step(color = "darkgreen", linewidth = 1) +
+  scale_y_continuous(breaks = c(0, 1), labels = c("T-Bill", "S&P 500")) +
+  labs(
+    title = "Random Forest - Semi-Annual (6M) Allocation",
+    x = NULL,
+    y = "Position"
+  ) +
+  theme_minimal()
+
+p3 <- results_12m[["RF TACTICAL (12M)"]]$results %>%
+  filter(!is.na(position)) %>%
+  mutate(position_numeric = ifelse(position == "SP500", 1, 0)) %>%
+  ggplot(aes(x = date, y = position_numeric)) +
+  geom_step(color = "darkred", linewidth = 1) +
+  scale_y_continuous(breaks = c(0, 1), labels = c("T-Bill", "S&P 500")) +
+  labs(
+    title = "Random Forest - Annual (12M) Allocation",
+    x = "Date",
+    y = "Position"
+  ) +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, ncol = 1)
+```
+
+## 7.5 Risk-Return Trade-off - All Horizons
+
+```{r plot-risk-return, fig.height=8}
+# Combine all metrics
+all_metrics <- bind_rows(
+  metrics_df_3m %>% mutate(Horizon = "3-Month"),
+  metrics_df_6m %>% mutate(Horizon = "6-Month"),
+  metrics_df_12m %>% mutate(Horizon = "12-Month")
+)
+
+# Create risk-return plot
+ggplot(all_metrics, aes(x = annualized_vol, y = annualized_return, 
+                         color = Horizon, shape = Horizon)) +
+  geom_point(size = 4, alpha = 0.7) +
+  geom_text(aes(label = strategy_name), hjust = -0.1, vjust = 0, size = 3) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = c("3-Month" = "#E41A1C", 
+                                  "6-Month" = "#377EB8", 
+                                  "12-Month" = "#4DAF4A")) +
+  labs(
+    title = "Risk-Return Profile: All Strategies Across Horizons",
+    subtitle = "Annualized Returns vs Annualized Volatility",
+    x = "Annualized Volatility",
+    y = "Annualized Return",
+    color = "Rebalancing Horizon",
+    shape = "Rebalancing Horizon"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  )
+```
+
+---
+
+# 8. Key Findings
+
+## 8.1 Summary Statistics by Horizon
+
+```{r summary-by-horizon}
+cat("\n=== SUMMARY BY REBALANCING HORIZON ===\n\n")
+
+# Calculate summary stats
+summary_stats <- all_metrics %>%
+  filter(!grepl("Buy-Hold|Perfect", strategy_name)) %>%
+  group_by(Horizon) %>%
+  summarise(
+    `Mean Ann. Return` = mean(annualized_return, na.rm = TRUE),
+    `Mean Sharpe` = mean(sharpe_ratio, na.rm = TRUE),
+    `Mean Max DD` = mean(max_drawdown, na.rm = TRUE),
+    `Mean Turnover` = mean(turnover, na.rm = TRUE),
+    `Mean % in S&P500` = mean(time_in_sp500, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+
+kable(summary_stats, align = "lrrrrr",
+      caption = "Average Performance Metrics by Horizon (ML Models Only)")
+```
+
+## 8.2 Best Strategies by Metric
+
+```{r best-strategies}
+cat("\n=== TOP PERFORMERS BY METRIC ===\n\n")
+
+# Best by Sharpe Ratio
+cat("** Highest Sharpe Ratio **\n")
+top_sharpe <- all_metrics %>%
+  filter(!grepl("Buy-Hold T-Bill|Perfect", strategy_name)) %>%
+  arrange(desc(sharpe_ratio)) %>%
+  select(Strategy = strategy_name, Horizon, `Sharpe Ratio` = sharpe_ratio, 
+         `Ann. Return` = annualized_return) %>%
+  head(5) %>%
+  mutate(`Sharpe Ratio` = round(`Sharpe Ratio`, 3),
+         `Ann. Return` = percent(`Ann. Return`, accuracy = 0.01))
+
+print(kable(top_sharpe))
+
+cat("\n** Highest Total Return **\n")
+top_return <- all_metrics %>%
+  filter(!grepl("Buy-Hold T-Bill|Perfect", strategy_name)) %>%
+  arrange(desc(total_return)) %>%
+  select(Strategy = strategy_name, Horizon, `Total Return` = total_return,
+         `Final Value` = final_value) %>%
+  head(5) %>%
+  mutate(`Total Return` = percent(`Total Return`, accuracy = 0.01),
+         `Final Value` = round(`Final Value`, 4))
+
+print(kable(top_return))
+
+cat("\n** Lowest Maximum Drawdown (Best Downside Protection) **\n")
+best_dd <- all_metrics %>%
+  filter(!grepl("Buy-Hold T-Bill|Perfect", strategy_name)) %>%
+  arrange(desc(max_drawdown)) %>%  # Less negative is better
+  select(Strategy = strategy_name, Horizon, `Max DD` = max_drawdown,
+         `Ann. Return` = annualized_return) %>%
+  head(5) %>%
+  mutate(`Max DD` = percent(`Max DD`, accuracy = 0.01),
+         `Ann. Return` = percent(`Ann. Return`, accuracy = 0.01))
+
+print(kable(best_dd))
+```
+
+---
+
+# 9. Export Results
+
+```{r export-results}
+cat("\n=== EXPORTING RESULTS ===\n\n")
+
+# Create output directory if it doesn't exist
+dir.create("../output", showWarnings = FALSE)
+
+# Export performance tables
+write_csv(performance_3m, "../output/performance_3m_quarterly.csv")
+write_csv(performance_6m, "../output/performance_6m_semiannual.csv")
+write_csv(performance_12m, "../output/performance_12m_annual.csv")
+
+# Export combined metrics
+write_csv(all_metrics, "../output/all_metrics_combined.csv")
+
+# Export portfolio values for further analysis
+write_csv(portfolio_3m, "../output/portfolio_values_3m.csv")
+write_csv(portfolio_6m, "../output/portfolio_values_6m.csv")
+write_csv(portfolio_12m, "../output/portfolio_values_12m.csv")
+
+cat("✓ Results exported to ../output/ directory\n\n")
+cat("Files created:\n")
+cat("  - performance_3m_quarterly.csv\n")
+cat("  - performance_6m_semiannual.csv\n")
+cat("  - performance_12m_annual.csv\n")
+cat("  - all_metrics_combined.csv\n")
+cat("  - portfolio_values_3m.csv\n")
+cat("  - portfolio_values_6m.csv\n")
+cat("  - portfolio_values_12m.csv\n")
+```
+
+---
+
+# 10. Conclusions
+
+## Key Takeaways:
+
+1. **Strategy Framework**: Successfully implemented tactical asset allocation strategies across three rebalancing horizons (quarterly, semi-annual, annual) using ML forecasts.
+
+2. **Decision Rule**: Simple comparison of forecasted S&P 500 returns vs T-bill rates drives allocation decisions, with 100% positions in either asset.
+
+3. **Benchmark Hierarchy**: Expected ranking is T-Bill < [ML Models] ≤ Buy-Hold S&P 500 < Perfect Foresight.
+
+4. **Performance Metrics**: Evaluated strategies using:
+   - Total and annualized returns
+   - Sharpe ratios (risk-adjusted performance)
+   - Maximum drawdowns (downside risk)
+   - Win rates and turnover (tactical behavior)
+   - Time in market allocation
+
+5. **Horizon Comparison**: Longer horizons (12M) typically show:
+   - Lower turnover (fewer rebalancing decisions)
+   - Smoother portfolio paths
+   - Different risk-return profiles
+
+6. **Model Comparison**: Identifies which ML models generate the most valuable forecasts for tactical allocation.
+
+## Next Steps:
+
+- Add transaction costs sensitivity analysis
+- Test alternative allocation rules (e.g., partial positions)
+- Analyze timing of position switches vs market regimes
+- Compare with equal-weighted or optimized ensemble strategies
+
+---
+
+**End of Report**

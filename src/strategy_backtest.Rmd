@@ -20,6 +20,8 @@ library(lubridate)
 library(ggplot2)
 library(knitr)
 library(scales)
+
+
 ```
 
 # Trading Strategy Overview
@@ -41,152 +43,289 @@ library(scales)
 
 # 1. Load Data
 
-## 1.1 Load T-Bill Data
+## 1.1 Load T-Bill Data (All Horizons)
 ```{r load-tbill}
-cat("Loading T-Bill data...\n")
+cat("\n=== LOADING T-BILL DATA (ALL HORIZONS) ===\n\n")
 
-# Load T-Bill 3-month rate (TB3MS)
-# Data is already quarterly: Jan, Apr, Jul, Oct (same as S&P 500)
-tbill_data <- read_xlsx("../data/TB3MS.xlsx", sheet = 2) %>%
+# Testing period starts 2011-10-01 (Q207)
+TEST_START_DATE <- as.Date("2011-10-01")
+
+# ===== 3-MONTH T-BILL (Quarterly) =====
+cat("1. Loading 3-Month T-Bill (TB3MS) - for quarterly strategy...\n")
+tbill_3m <- read_xlsx("../data/TB3MS.xlsx", sheet = 2) %>%
   rename(date = observation_date) %>%
-  filter(year(date) >= 1960) %>%
+  mutate(date = as.Date(date)) %>%
+  filter(date >= TEST_START_DATE) %>%
+  arrange(date) %>%
+  mutate(
+    # TB3MS is annualized bank-discount yield (%)
+    # Convert to 3-month holding period return
+    discount_rate = TB3MS / 100,
+    price = 1 - discount_rate * (90/360),
+    tbill_return_1q = (1 / price) - 1
+  ) %>%
+  select(date, tbill_return_1q)
+
+cat("   ✓ 3M T-Bill loaded:", nrow(tbill_3m), "quarterly observations\n")
+cat("   Date range:", min(tbill_3m$date), "to", max(tbill_3m$date), "\n\n")
+
+# ===== 6-MONTH T-BILL (Daily → Convert to Quarterly) =====
+cat("2. Loading 6-Month T-Bill (DGS6MO) - for semi-annual strategy...\n")
+tbill_6m_daily <- read_csv("../data/DGS6MO.csv") %>%
+  rename(date = observation_date, rate = DGS6MO) %>%
+  mutate(date = as.Date(date)) %>%
+  filter(!is.na(rate), date >= TEST_START_DATE) %>%
   arrange(date)
 
-# Convert bank-discount yield to quarterly holding-period return
-# TB3MS is annualized bank-discount yield (%)
-# 
-# Formula (from FRED-MD documentation):
-# Price per $1 face = 1 - (discount_rate × 90/360)
-# Final value = 1 / Price = 1 / (1 - discount_rate × 90/360)
-# Quarterly return = Final value - 1
-#
-# Simplified: return = (discount_rate × 90/360) / (1 - discount_rate × 90/360)
-#
-# Example: If TB3MS = 3.8% (0.038 as decimal):
-#   Price = 1 - 0.038 × (90/360) = 0.9905
-#   Return = (1/0.9905) - 1 ≈ 0.00959 (0.959% for 3 months)
-
-tbill_data <- tbill_data %>%
+# Convert daily 6M T-Bill yields to quarterly observations
+tbill_6m <- tbill_6m_daily %>%
   mutate(
-    # Convert percentage to decimal
-    discount_rate = TB3MS / 100,
-    
-    # Calculate price per $1 face value (90-day T-bill, 360-day basis)
-    price = 1 - discount_rate * (90/360),
-    
-    # Calculate 3-month holding period return
-    tbill_quarterly_return = (1 / price) - 1
+    year = year(date),
+    quarter = quarter(date)
   ) %>%
-  select(date, TB3MS, discount_rate, price, tbill_quarterly_return)
+  # Keep only last observation of each quarter
+  group_by(year, quarter) %>%
+  slice_max(date, n = 1) %>%
+  ungroup() %>%
+  mutate(
+    # DGS6MO is annualized yield (%)
+    # Convert to 6-month holding period return
+    annual_yield = rate / 100,
+    tbill_return_6m = (1 + annual_yield)^(0.5) - 1,
+    # Standardize to quarterly dates (first day of quarter)
+    date = floor_date(date, "quarter")
+  ) %>%
+  select(date, tbill_return_6m)
 
-cat("T-Bill data loaded:", nrow(tbill_data), "quarterly observations\n")
-cat("Date range:", min(tbill_data$date), "to", max(tbill_data$date), "\n")
-cat("\nSample data (showing calculation):\n")
-head(tbill_data, 10)
+cat("   ✓ 6M T-Bill loaded:", nrow(tbill_6m), "quarterly observations\n")
+cat("   Date range:", min(tbill_6m$date), "to", max(tbill_6m$date), "\n\n")
+
+# ===== 1-YEAR T-BILL (Daily → Convert to Quarterly) =====
+cat("3. Loading 1-Year T-Bill (DGS1) - for annual strategy...\n")
+tbill_1y_daily <- read_csv("../data/DGS1.csv") %>%
+  rename(date = observation_date, rate = DGS1) %>%
+  mutate(date = as.Date(date)) %>%
+  filter(!is.na(rate), date >= TEST_START_DATE) %>%
+  arrange(date)
+
+# Convert daily 1Y T-Bill yields to quarterly observations
+tbill_1y <- tbill_1y_daily %>%
+  mutate(
+    year = year(date),
+    quarter = quarter(date)
+  ) %>%
+  group_by(year, quarter) %>%
+  slice_max(date, n = 1) %>%
+  ungroup() %>%
+  mutate(
+    # DGS1 is annualized yield (%)
+    # Use as-is for 1-year holding period return
+    tbill_return_1y = rate / 100,
+    # Standardize to quarterly dates
+    date = floor_date(date, "quarter")
+  ) %>%
+  select(date, tbill_return_1y)
+
+cat("   ✓ 1Y T-Bill loaded:", nrow(tbill_1y), "quarterly observations\n")
+cat("   Date range:", min(tbill_1y$date), "to", max(tbill_1y$date), "\n\n")
+
+# ===== COMBINE ALL T-BILL HORIZONS =====
+cat("=== COMBINING T-BILL DATA ===\n")
+tbill_all <- tbill_3m %>%
+  left_join(tbill_6m, by = "date") %>%
+  left_join(tbill_1y, by = "date") %>%
+  # Keep only rows where ALL three horizons have data
+  filter(!is.na(tbill_return_1q) & !is.na(tbill_return_6m) & !is.na(tbill_return_1y))
+
+cat("✓ T-Bill data combined (TESTING PERIOD ONLY):\n")
+cat("  Observations:", nrow(tbill_all), "quarters\n")
+cat("  Date range:", min(tbill_all$date), "to", max(tbill_all$date), "\n")
+cat("  Columns: tbill_return_1q, tbill_return_6m, tbill_return_1y\n\n")
+
+cat("Sample T-Bill data (first 10 rows):\n")
+print(head(tbill_all, 10))
 ```
 
-## 1.2 Load ML Model Forecasts
+
+## 1.2 Load ML Model Forecasts (Multi-Horizon)
 ```{r load-forecasts}
-cat("Loading ML model forecasts and actual returns...\n")
+cat("\n=== LOADING MULTI-HORIZON ML MODEL FORECASTS ===\n\n")
 
-# Load Random Forest predictions (from rf_tuned_recur.Rmd)
-rf_forecasts <- read_csv("../data/rf_evals.csv") %>%
-  select(date, log_ret, rf_forecast_ret) %>%
+# ===== RANDOM FOREST: All Horizons =====
+# File: rf_evals_all_horizons.csv (long format with 'horizon' column)
+cat("1. Loading Random Forest predictions (all horizons)...\n")
+rf_all <- read_csv("../data/rf_evals_all_horizons.csv") %>%
+  select(date, actual, forecast, horizon) %>%
+  arrange(date, horizon)
+
+# Reshape RF from long to wide format
+rf_forecasts <- rf_all %>%
+  pivot_wider(
+    names_from = horizon,
+    values_from = c(actual, forecast),
+    names_glue = "{.value}_{horizon}"
+  ) %>%
+  rename(
+    actual_1q = actual_3m,
+    actual_1y = actual_12m,
+    rf_forecast_1q = forecast_3m,
+    rf_forecast_1y = forecast_12m
+    # Note: actual_6m and forecast_6m already have correct names
+  ) %>%
   arrange(date)
 
-# Load XGBoost predictions (from xgb_tuned_recur.Rmd)
-xgb_forecasts <- read_csv("../data/xgb_evals.csv") %>%
-  select(date, xgb_forecast_ret) %>%
+cat("   ✓ RF loaded:", nrow(rf_forecasts), "observations\n")
+cat("   Horizons: 1Q (3m), 6M, 1Y (12m)\n\n")
+
+# ===== XGBOOST: All Horizons =====
+# TODO: Add XGBoost multi-horizon predictions when available
+# Expected file: xgb_evals_all_horizons.csv or similar
+cat("2. XGBoost predictions...\n")
+cat("   ⚠ XGBoost multi-horizon file not found in data folder\n")
+cat("   NOTE: Will skip XGBoost for now. Add file when ready.\n\n")
+
+# ===== LASSO: All Horizons =====
+cat("3. Loading Lasso predictions (all horizons)...\n")
+lasso_forecasts <- read_csv("../data/lasso_test_predictions.csv") %>%
+  rename(
+    actual_1q = actual_3m,
+    actual_1y = actual_12m,
+    lasso_forecast_1q = predicted_3m,
+    lasso_forecast_6m = predicted_6m,
+    lasso_forecast_1y = predicted_12m
+  ) %>%
+  select(date, lasso_forecast_1q, lasso_forecast_6m, lasso_forecast_1y) %>%
   arrange(date)
 
-# Load Lasso predictions
-lasso_forecasts <- read_csv("../data/lasso_predictions.csv") %>%
-  select(date, lasso_forecast_ret) %>%
+cat("   ✓ Lasso loaded:", nrow(lasso_forecasts), "observations\n")
+cat("   Horizons: 1Q (3m), 6M, 1Y (12m)\n\n")
+
+# ===== RIDGE: All Horizons =====
+cat("4. Loading Ridge predictions (all horizons)...\n")
+ridge_forecasts <- read_csv("../data/ridge_test_predictions.csv") %>%
+  rename(
+    ridge_forecast_1q = predicted_3m,
+    ridge_forecast_6m = predicted_6m,
+    ridge_forecast_1y = predicted_12m
+  ) %>%
+  select(date, ridge_forecast_1q, ridge_forecast_6m, ridge_forecast_1y) %>%
   arrange(date)
 
-# Load Ridge predictions
-ridge_forecasts <- read_csv("../data/ridge_predictions.csv") %>%
-  select(date, ridge_forecast_ret) %>%
+cat("   ✓ Ridge loaded:", nrow(ridge_forecasts), "observations\n")
+cat("   Horizons: 1Q (3m), 6M, 1Y (12m)\n\n")
+
+# ===== PCR: All Horizons =====
+cat("5. Loading PCR predictions (all horizons)...\n")
+pcr_forecasts <- read_csv("../data/pcr_test_predictions.csv") %>%
+  rename(
+    pcr_forecast_1q = predicted_3m,
+    pcr_forecast_6m = predicted_6m,
+    pcr_forecast_1y = predicted_12m
+  ) %>%
+  select(date, pcr_forecast_1q, pcr_forecast_6m, pcr_forecast_1y) %>%
   arrange(date)
 
-# Load PCR predictions
-pcr_forecasts <- read_csv("../data/pcr_predictions.csv") %>%
-  select(date, pcr_forecast_ret) %>%
+cat("   ✓ PCR loaded:", nrow(pcr_forecasts), "observations\n")
+cat("   Horizons: 1Q (3m), 6M, 1Y (12m)\n\n")
+
+# ===== ELASTIC NET: All Horizons =====
+cat("6. Loading Elastic Net predictions (all horizons)...\n")
+elastic_forecasts <- read_csv("../data/elastic_net_test_predictions.csv") %>%
+  rename(
+    elastic_forecast_1q = predicted_3m,
+    elastic_forecast_6m = predicted_6m,
+    elastic_forecast_1y = predicted_12m
+  ) %>%
+  select(date, elastic_forecast_1q, elastic_forecast_6m, elastic_forecast_1y) %>%
   arrange(date)
 
-# Load Elastic Net predictions
-elastic_forecasts <- read_csv("../data/elastic_predictions.csv") %>%
-  select(date, elastic_forecast_ret) %>%
-  arrange(date)
+cat("   ✓ Elastic Net loaded:", nrow(elastic_forecasts), "observations\n")
+cat("   Horizons: 1Q (3m), 6M, 1Y (12m)\n\n")
 
-# Load Ensemble predictions (from ensemble_lsei.Rmd)
-ensemble_forecasts <- read_csv("../data/ensemble_predictions.csv") %>%
-  select(date, ensemble_forecast_ret) %>%
-  arrange(date)
+# ===== ENSEMBLE: All Horizons =====
+cat("7. Loading Ensemble predictions (all horizons)...\n")
+cat("   ⚠ Ensemble multi-horizon file not yet created\n")
+cat("   NOTE: Run ensemble_lsei.Rmd first to generate ensemble forecasts\n")
+cat("   Expected file: ensemble_predictions_multihorizon.csv\n\n")
 
-# Combine all forecasts
+# ===== COMBINE ALL FORECASTS =====
+cat("=== COMBINING ALL FORECASTS ===\n")
 forecast_data <- rf_forecasts %>%
-  left_join(xgb_forecasts, by = "date") %>%
   left_join(lasso_forecasts, by = "date") %>%
   left_join(ridge_forecasts, by = "date") %>%
   left_join(pcr_forecasts, by = "date") %>%
-  left_join(elastic_forecasts, by = "date") %>%
-  left_join(ensemble_forecasts, by = "date")
+  left_join(elastic_forecasts, by = "date")
 
-cat("Forecast data loaded:", nrow(forecast_data), "quarterly observations\n")
-cat("Date range:", min(forecast_data$date), "to", max(forecast_data$date), "\n")
-cat("\nColumns available:\n")
-cat("  - date: Quarter dates\n")
-cat("  - log_ret: Actual S&P 500 quarterly returns\n")
-cat("  - rf_forecast_ret: Random Forest predictions\n")
-cat("  - xgb_forecast_ret: XGBoost predictions\n")
-cat("  - lasso_forecast_ret: Lasso predictions\n")
-cat("  - ridge_forecast_ret: Ridge predictions\n")
-cat("  - pcr_forecast_ret: PCR predictions\n")
-cat("  - elastic_forecast_ret: Elastic Net predictions\n")
-cat("  - ensemble_forecast_ret: Ensemble (LSEI) predictions\n")
-cat("\nSample data:\n")
-head(forecast_data, 10)
+cat("\n✓ Multi-horizon forecast data combined\n")
+cat("  Observations:", nrow(forecast_data), "quarters\n")
+cat("  Date range:", min(forecast_data$date), "to", max(forecast_data$date), "\n\n")
+
+cat("Available columns:\n")
+cat("  Actual returns:\n")
+cat("    - actual_1q: Actual 1-quarter (3-month) S&P 500 returns\n")
+cat("    - actual_6m: Actual 6-month S&P 500 returns\n")
+cat("    - actual_1y: Actual 1-year (12-month) S&P 500 returns\n\n")
+cat("  Model forecasts (1Q horizon):\n")
+cat("    - rf_forecast_1q, lasso_forecast_1q, ridge_forecast_1q,\n")
+cat("      pcr_forecast_1q, elastic_forecast_1q\n\n")
+cat("  Model forecasts (6M horizon):\n")
+cat("    - rf_forecast_6m, lasso_forecast_6m, ridge_forecast_6m,\n")
+cat("      pcr_forecast_6m, elastic_forecast_6m\n\n")
+cat("  Model forecasts (1Y horizon):\n")
+cat("    - rf_forecast_1y, lasso_forecast_1y, ridge_forecast_1y,\n")
+cat("      pcr_forecast_1y, elastic_forecast_1y\n\n")
+
+cat("Sample data (first 5 rows):\n")
+print(head(forecast_data, 5))
 ```
 
-## 1.3 Prepare T-Bill Data for Backtesting
-```{r prepare-tbill}
-# T-Bill data is already quarterly - just rename for clarity
-tbill_quarterly <- tbill_data %>%
-  select(date, tbill_quarterly_return) %>%
-  arrange(date)
-
-cat("\nT-Bill data ready for backtesting:", nrow(tbill_quarterly), "quarterly observations\n")
-cat("Date range:", min(tbill_quarterly$date), "to", max(tbill_quarterly$date), "\n")
-cat("Sample:\n")
-head(tbill_quarterly, 10)
-```
-
-## 1.4 Merge All Data for Backtesting
+## 1.3 Merge Forecasts with T-Bill Data
 ```{r merge-data}
-cat("\n=== Merging Forecast Data with T-Bill Returns ===\n")
+cat("\n=== MERGING FORECAST DATA WITH T-BILL RETURNS ===\n")
 
-# Merge forecasts with T-bill returns
+# Merge all forecast data with T-bill returns
 backtest_data <- forecast_data %>%
-  left_join(tbill_quarterly, by = "date") %>%
+  left_join(tbill_all, by = "date") %>%
   drop_na()  # Remove any rows with missing data
 
-cat("\n=== Backtest Dataset Ready ===\n")
-cat("Total observations:", nrow(backtest_data), "quarters\n")
-cat("Date range:", min(backtest_data$date), "to", max(backtest_data$date), "\n")
-cat("\nColumns:\n")
-cat("  - date: Quarter dates\n")
-cat("  - log_ret: Actual S&P 500 returns (realized)\n")
-cat("  - rf_forecast_ret: Random Forest forecasts\n")
-cat("  - xgb_forecast_ret: XGBoost forecasts\n")
-cat("  - lasso_forecast_ret: Lasso forecasts\n")
-cat("  - ridge_forecast_ret: Ridge forecasts\n")
-cat("  - pcr_forecast_ret: PCR forecasts\n")
-cat("  - elastic_forecast_ret: Elastic Net forecasts\n")
-cat("  - ensemble_forecast_ret: Ensemble (LSEI) forecasts\n")
-cat("  - tbill_quarterly_return: T-bill returns (risk-free alternative)\n")
-cat("\nSample merged data:\n")
-head(backtest_data, 10)
+cat("\n✓ Backtest dataset ready!\n")
+cat("  Observations:", nrow(backtest_data), "quarters\n")
+cat("  Date range:", min(backtest_data$date), "to", max(backtest_data$date), "\n\n")
+
+cat("=== FINAL DATASET STRUCTURE ===\n")
+cat("\n📊 ACTUAL RETURNS (3 horizons):\n")
+cat("  - actual_1q: Realized 1-quarter S&P 500 returns\n")
+cat("  - actual_6m: Realized 6-month S&P 500 returns\n")
+cat("  - actual_1y: Realized 1-year S&P 500 returns\n\n")
+
+cat("🔮 MODEL FORECASTS (1Q - Quarterly Rebalancing):\n")
+cat("  - rf_forecast_1q, lasso_forecast_1q, ridge_forecast_1q,\n")
+cat("    pcr_forecast_1q, elastic_forecast_1q\n\n")
+
+cat("🔮 MODEL FORECASTS (6M - Semi-Annual Rebalancing):\n")
+cat("  - rf_forecast_6m, lasso_forecast_6m, ridge_forecast_6m,\n")
+cat("    pcr_forecast_6m, elastic_forecast_6m\n\n")
+
+cat("🔮 MODEL FORECASTS (1Y - Annual Rebalancing):\n")
+cat("  - rf_forecast_1y, lasso_forecast_1y, ridge_forecast_1y,\n")
+cat("    pcr_forecast_1y, elastic_forecast_1y\n\n")
+
+cat("💰 T-BILL RETURNS (Risk-Free Rates):\n")
+cat("  - tbill_return_1q: 3-month T-bill (quarterly)\n")
+cat("  - tbill_return_6m: 6-month T-bill (semi-annual)\n")
+cat("  - tbill_return_1y: 1-year T-bill (annual)\n\n")
+
+cat("Total columns in dataset:", ncol(backtest_data), "\n\n")
+
+cat("Column names:\n")
+print(names(backtest_data))
+
+cat("\n\nSample merged data (first 5 rows):\n")
+print(head(backtest_data, 5))
+
+cat("\n\nSummary statistics:\n")
+summary(backtest_data %>% select(actual_1q, actual_6m, actual_1y, 
+                                   tbill_return_1q, tbill_return_6m, tbill_return_1y))
 ```
 
 ---
