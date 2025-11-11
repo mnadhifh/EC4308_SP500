@@ -10,6 +10,7 @@ date: "2025-11-10"
 # SETTING UP LIBRARIES
 library(dplyr)
 library(tidyverse)
+library(zoo)
 library(lubridate)
 library(ggplot2)
 library(Metrics)
@@ -127,6 +128,12 @@ rf_model_final <- randomForest(
   nodesize = best_params_rf$nodesize
 )
 
+# --- STEP 4: Predictions ---
+# will NOT do recusrive estimation, simple prediction only
+
+rf_train_forecasts <- predict(rf_model_final,
+                             newdata = train_data %>% select(-date, -log_ret))
+
 rf_forecasts <- predict(rf_model_final, 
                         newdata = test_data %>% select(-date, -log_ret))
 
@@ -134,7 +141,7 @@ rf_forecasts <- predict(rf_model_final,
 cat("Prediction complete!\n")
 
 # Store forecasts in df
-rf_df$rf_forecast_ret <- c(rep(NA, train_size), rf_forecasts)
+rf_df$rf_forecast_ret <- c(rf_train_forecasts, rf_forecasts)
 
 
 ```
@@ -350,6 +357,17 @@ plot(rf_model_final, main = "OOB Error vs Number of Trees (Random Forest)")
 
 ``` {r}
 # save model for later use 
-#write_csv(rf_df, "../data/rf_results.csv")
-#write_csv(rf_eval_df, "../data/rf_evals.csv")
+write_csv(rf_df, "../data/rf_results.csv")
+write_csv(rf_eval_df, "../data/rf_evals.csv")
+
+
+# for train data and predictions only
+rf_train_preds <- rf_df %>%
+  head(train_size) %>%  
+  filter(
+    !is.na(log_ret),
+    !is.na(rf_forecast_ret)
+  )
+  
+write_csv(rf_train_preds, "../data/rf_train_predictions.csv")  
 ```
