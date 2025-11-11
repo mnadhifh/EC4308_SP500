@@ -26,18 +26,18 @@ data <- data %>%
   left_join(data_mean %>% select(date, mean_prevailing_ret), by = "date")
 
 # prepare rf_df and train/test split
-rf_df <- data %>%
+pcr_df <- data %>%
   arrange(date) %>%
   select(-mean_prevailing_ret) %>%
   drop_na()
 
 set.seed(123)
-n <- nrow(rf_df)
+n <- nrow(pcr_df)
 train_size <- floor(0.8 * n)
 test_size  <- n - train_size
 
-train_data <- rf_df[1:train_size, ]
-test_data  <- rf_df[(train_size + 1):n, ]
+train_data <- pcr_df[1:train_size, ]
+test_data  <- pcr_df[(train_size + 1):n, ]
 
 # tuning split inside training sample (we will apply recursive CV inside training only) 
 # initial training window for recursive CV (inside training)
@@ -116,11 +116,15 @@ pcr_final <- pcr(
 X_test_full <- test_data %>% select(-date, -log_ret)
 pcr_test_preds <- as.numeric(predict(pcr_final, newdata = X_test_full, ncomp = best_ncomp))
 
+# Predict on train set
+X_train_full <- train_data %>% select (-date, -log_ret)
+pcr_train_preds <- as.numeric(predict(pcr_final, newdata = X_train_full, ncomp = best_ncomp))
+
 # attach predictions to rf_df aligned with test indices
-rf_df$pcr_forecast_ret <- c(rep(NA, train_size), pcr_test_preds)
+pcr_df$pcr_forecast_ret <- c(rep(NA, train_size), pcr_test_preds)
 
 # Prepare plotting dataframe (include prevailing mean)
-plot_pcr_df <- rf_df %>%
+plot_pcr_df <- pcr_df %>%
   left_join(data %>% select(date, mean_prevailing_ret), by = "date")
 ```
 
