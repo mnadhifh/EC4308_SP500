@@ -1,0 +1,205 @@
+---
+title: "PCR"
+author: "Dawn"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(Metrics)
+library(forecast)
+library(pls)
+```
+
+
+```{r}
+data  <- read.csv("../data/data_merged.csv", stringsAsFactors = FALSE)
+data_mean <- read.csv("../data/prevail_mean.csv", stringsAsFactors = FALSE)
+data$date <- as.Date(data$date)
+data_mean$date <- as.Date(data_mean$date)
+data <- data %>%
+  select(date, log_ret, matches("_L[1-4]$")) %>%
+  left_join(data_mean %>% select(date, mean_prevailing_ret), by = "date")
+
+# prepare rf_df and train/test split
+rf_df <- data %>%
+  arrange(date) %>%
+  select(-mean_prevailing_ret) %>%
+  drop_na()
+
+set.seed(123)
+n <- nrow(rf_df)
+train_size <- floor(0.8 * n)
+test_size  <- n - train_size
+
+train_data <- rf_df[1:train_size, ]
+test_data  <- rf_df[(train_size + 1):n, ]
+
+# tuning split inside training sample (we will apply recursive CV inside training only) 
+# initial training window for recursive CV (inside training)
+init_train_frac <- 0.8           # fraction of training sample used as initial window
+train_tune_size <- floor(init_train_frac * train_size)
+val_tune_size   <- train_size - train_tune_size   # number of recursive one-step-ahead predictions to produce for validation
+
+X_train_tune_full <- train_data %>% select(-date, -log_ret)
+y_train_tune_full <- train_data$log_ret
+
+# recursive CV on validation to choose ncomp
+max_comps <- min(20, ncol(X_train_tune_full))
+if (max_comps < 1) stop("No predictors found for PCR tuning.")
+
+val_rmse_vec <- numeric(max_comps)
+
+for (ncomp in 1:max_comps) {
+  # produce recursive (expanding-window) one-step-ahead preds across validation portion
+  val_preds_recursive <- numeric(val_tune_size)
+  for (i in 1:val_tune_size) {
+    # expanding window: use observations 1 : (train_tune_size + i - 1) to predict next point (train_tune_size + i)
+    train_idx_end <- train_tune_size + i - 1
+    train_subset <- train_data[1:train_idx_end, ]
+    val_point    <- train_data[train_idx_end + 1, , drop = FALSE]
+    
+    X_train_sub <- train_subset %>% select(-date, -log_ret)
+    y_train_sub <- train_subset$log_ret
+    X_val_point <- val_point %>% select(-date, -log_ret)
+    
+    pcr_sub <- pcr(
+      y_train_sub ~ .,
+      data = cbind(y_train_sub, X_train_sub),
+      ncomp = ncomp,
+      scale = TRUE,
+      center = TRUE,
+      validation = "none"
+    )
+    pred_val <- as.numeric(predict(pcr_sub, newdata = X_val_point, ncomp = ncomp))
+    val_preds_recursive[i] <- pred_val
+  }
+  # true validation targets (the val_tune_size points)
+  y_val_true <- train_data$log_ret[(train_tune_size + 1):train_size]
+  val_rmse_vec[ncomp] <- sqrt(mean((y_val_true - val_preds_recursive)^2, na.rm = TRUE))
+}
+
+
+
+best_ncomp <- which.min(val_rmse_vec)
+best_val_rmse <- val_rmse_vec[best_ncomp]
+
+# Plot: Validation RMSE vs ncomp
+val_df <- data.frame(ncomp = 1:max_comps, val_rmse = val_rmse_vec)
+p_valcurve <- ggplot(val_df, aes(x = ncomp, y = val_rmse)) +
+  geom_line() + geom_point() +
+  geom_vline(xintercept = best_ncomp, linetype = "dashed", color = "red") +
+  annotate("text", x = best_ncomp, y = min(val_rmse_vec), label = paste0("best n=", best_ncomp),
+           vjust = -1, color = "red") +
+  labs(title = "Validation RMSE vs PCR components (recursive CV on training)", x = "Number of components", y = "Validation RMSE") +
+  theme_minimal()
+print(p_valcurve)
+
+# Fit final PCR model once on full training set using best_ncomp
+X_train_full <- train_data %>% select(-date, -log_ret)
+y_train_full <- train_data$log_ret
+
+pcr_final <- pcr(
+  y_train_full ~ .,
+  data = cbind(y_train_full, X_train_full),
+  ncomp = best_ncomp,
+  scale = TRUE,
+  center = TRUE,
+  validation = "none"
+)
+
+# Predict on test set
+X_test_full <- test_data %>% select(-date, -log_ret)
+pcr_test_preds <- as.numeric(predict(pcr_final, newdata = X_test_full, ncomp = best_ncomp))
+
+# attach predictions to rf_df aligned with test indices
+rf_df$pcr_forecast_ret <- c(rep(NA, train_size), pcr_test_preds)
+
+# Prepare plotting dataframe (include prevailing mean)
+plot_pcr_df <- rf_df %>%
+  left_join(data %>% select(date, mean_prevailing_ret), by = "date")
+```
+
+
+```{r}
+# Plot: Actual vs Prevailing mean vs PCR (TEST SET)
+plot_test <- plot_pcr_df %>% tail(test_size)
+p_ts <- ggplot(plot_test, aes(x = date)) +
+  geom_line(aes(y = log_ret, color = "Actual")) +
+  geom_line(aes(y = mean_prevailing_ret, color = "Prevailing mean")) +
+  geom_line(aes(y = pcr_forecast_ret, color = "PCR"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual" = "black", "Prevailing mean" = "blue", "PCR" = "darkgreen")) +
+  labs(title = "Test set: Actual vs Prevailing Mean vs PCR (final model predicts test set)", x = "Date", y = "Log Return", color = "") +
+  theme_minimal()
+print(p_ts)
+
+# Scatter: Actual vs Predicted (PCR)
+scatter_df <- plot_test %>% filter(!is.na(pcr_forecast_ret))
+p_scatter <- ggplot(scatter_df, aes(x = pcr_forecast_ret, y = log_ret)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Actual vs PCR Predicted (TEST)", x = "PCR predicted", y = "Actual") +
+  theme_minimal()
+print(p_scatter)
+
+# Residuals time plot
+resid_df <- scatter_df %>% mutate(resid_pcr = log_ret - pcr_forecast_ret)
+p_resid <- ggplot(resid_df, aes(x = date, y = resid_pcr)) +
+  geom_hline(yintercept = 0, color = "gray") +
+  geom_line() +
+  labs(title = "PCR Residuals (Test set)", x = "Date", y = "Residual (Actual - Pred)") +
+  theme_minimal()
+print(p_resid)
+```
+
+
+```{r}
+# Compute metrics
+actual_pcr <- test_data$log_ret
+pred_pcr   <- pcr_test_preds
+
+MAE_pcr  <- mean(abs(actual_pcr - pred_pcr), na.rm = TRUE)
+RMSE_pcr <- sqrt(mean((actual_pcr - pred_pcr)^2, na.rm = TRUE))
+R2_pcr   <- cor(actual_pcr, pred_pcr, use = "complete.obs")^2
+
+metrics_tbl <- data.frame(
+  Model = "PCR",
+  MAE = MAE_pcr,
+  RMSE = RMSE_pcr,
+  R2 = R2_pcr,
+  ncomp = best_ncomp,
+  val_RMSE = best_val_rmse
+)
+print(metrics_tbl)
+```
+
+
+```{r}
+# DM Test (simple): use test set errors
+pcr_eval_df <- plot_test %>%
+  filter(!is.na(pcr_forecast_ret) & !is.na(mean_prevailing_ret)) %>%
+  mutate(
+    err_pcr  = log_ret - pcr_forecast_ret,
+    err_mean = log_ret - mean_prevailing_ret
+  )
+
+if (nrow(pcr_eval_df) < 2) {
+  message("Not enough observations with both forecasts to run DM test (need >= 2).")
+} else {
+  dm_test_pcr <- dm.test(e1 = pcr_eval_df$err_pcr, e2 = pcr_eval_df$err_mean, alternative = "less")
+  print(dm_test_pcr)
+  if (dm_test_pcr$p.value < 0.05) {
+    cat("Conclusion: PCR significantly outperforms the Prevailing Mean model (lower forecast error).\n")
+  } else {
+    cat("Conclusion: PCR does NOT significantly outperform the Prevailing Mean model.\n")
+  }
+}
+
+
+```
+
+
