@@ -328,7 +328,19 @@ ggplot(test_results, aes(x = actual, y = forecasted)) +
 ```{r}
 # ---- Save LASSO Regression Predictions and Results ----
 
-# Create results dataframe with predictions
+# Create results dataframe with TRAINING predictions
+y_pred_train <- predict(fit, newx = X_train, s = lambda_opt)
+
+lasso_train_predictions <- data.frame(
+  date = train_data$date,
+  lasso_actual = y_train,
+  lasso_forecast = as.numeric(y_pred_train)
+)
+
+# Save training predictions to CSV
+write.csv(lasso_train_predictions, "../data/lasso_train_predictions.csv", row.names = FALSE)
+
+# Create results dataframe with TEST predictions
 lasso_predictions <- test_results %>%
   select(date, actual, forecasted) %>%
   rename(
@@ -336,7 +348,7 @@ lasso_predictions <- test_results %>%
     lasso_actual = actual
   )
 
-# Save predictions to CSV
+# Save test predictions to CSV
 write.csv(lasso_predictions, "../data/lasso_predictions.csv", row.names = FALSE)
 
 # Save model evaluation metrics
@@ -354,8 +366,58 @@ write.csv(lasso_metrics, "../data/lasso_metrics.csv", row.names = FALSE)
 write.csv(lasso_result$bic_tbl, "../data/lasso_bic_table.csv", row.names = FALSE)
 
 cat("\n=== LASSO Regression Results Saved ===\n")
-cat("✓ Predictions saved to: ../data/lasso_predictions.csv\n")
+cat("✓ Training predictions saved to: ../data/lasso_train_predictions.csv\n")
+cat("✓ Test predictions saved to: ../data/lasso_predictions.csv\n")
 cat("✓ Metrics saved to: ../data/lasso_metrics.csv\n")
 cat("✓ BIC table saved to: ../data/lasso_bic_table.csv\n")
+
+```
+
+```{r}
+# ---- Visualize training set: Forecasted vs Actual ----
+
+# Create a data frame for training set plotting
+train_results <- data.frame(
+  date = train_data$date,
+  actual = y_train,
+  forecasted = as.numeric(y_pred_train),
+  obs_num = seq_along(y_train)
+)
+
+# Line plot: Forecasted vs Actual for training set
+ggplot(train_results, aes(x = date)) +
+  geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
+  geom_line(aes(y = forecasted, color = "LASSO Forecast"), linewidth = 0.8, linetype = "dashed") +
+  labs(
+    title = "LASSO Regression: Forecasted vs Actual Returns (Training Set)",
+    x = "Date",
+    y = "Log Return",
+    color = "Series"
+  ) +
+  scale_color_manual(values = c("Actual" = "steelblue", "LASSO Forecast" = "coral")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+# ---- Scatter plot: Training set Forecasted vs Actual ----
+
+# Compute training metrics for display
+mae_train <- mae(y_train, y_pred_train)
+rmse_train <- rmse(y_train, y_pred_train)
+r2_train <- cor(y_train, y_pred_train)^2
+
+ggplot(train_results, aes(x = actual, y = forecasted)) +
+  geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "LASSO Regression: Training Set Forecast Accuracy",
+    x = "Actual Return",
+    y = "Forecasted Return",
+    subtitle = paste("R² =", round(r2_train, 4), "| RMSE =", round(rmse_train, 6))
+  ) +
+  theme_minimal() +
+  coord_fixed(ratio = 1)
 
 ```

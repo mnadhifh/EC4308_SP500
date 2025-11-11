@@ -30,9 +30,10 @@ data <- data %>%
   select(
     date,
     log_ret,
-    matches("_L[1-4]$")       # only lagged features
+    matches("^price_fd_L[1-5]$"),
+    matches("^log_ret_L[1-5]$"),
+    matches("_L[2-5]$")       # only lagged features from at least 2 periods ago
   ) %>%
-  select(-matches("price")) %>% 
   left_join(
     data_mean %>% select(date, mean_prevailing_ret),
     by = "date"
@@ -339,7 +340,19 @@ ggplot(test_results, aes(x = actual, y = forecasted)) +
 ```{r}
 # ---- Save Ridge Regression Predictions and Results ----
 
-# Create results dataframe with predictions
+# Create results dataframe with TRAINING predictions
+y_pred_train <- predict(fit, newx = X_train, s = lambda_opt)
+
+ridge_train_predictions <- data.frame(
+  date = train_data$date,
+  ridge_actual = y_train,
+  ridge_forecast = as.numeric(y_pred_train)
+)
+
+# Save training predictions to CSV
+write.csv(ridge_train_predictions, "../data/ridge_train_predictions.csv", row.names = FALSE)
+
+# Create results dataframe with TEST predictions
 ridge_predictions <- test_results %>%
   select(date, actual, forecasted) %>%
   rename(
@@ -347,7 +360,7 @@ ridge_predictions <- test_results %>%
     ridge_actual = actual
   )
 
-# Save predictions to CSV
+# Save test predictions to CSV
 write.csv(ridge_predictions, "../data/ridge_predictions.csv", row.names = FALSE)
 
 # Save model evaluation metrics
@@ -365,8 +378,60 @@ ridge_metrics <- data.frame(
 # write.csv(ridge_result$bic_tbl, "../data/ridge_bic_table.csv", row.names = FALSE)
 
 cat("\n=== Ridge Regression Results Saved ===\n")
-cat("✓ Predictions saved to: ../data/ridge_predictions.csv\n")
+cat("✓ Training predictions saved to: ../data/ridge_train_predictions.csv\n")
+cat("✓ Test predictions saved to: ../data/ridge_predictions.csv\n")
 cat("✓ Metrics saved to: ../data/ridge_metrics.csv\n")
 cat("✓ BIC table saved to: ../data/ridge_bic_table.csv\n")
+
+```
+
+```{r}
+# ---- Visualize training set: Forecasted vs Actual ----
+
+# Create a data frame for training set plotting
+train_results <- data.frame(
+  date = train_data$date,
+  actual = y_train,
+  forecasted = as.numeric(y_pred_train),
+  obs_num = seq_along(y_train)
+)
+
+# Line plot: Forecasted vs Actual for training set
+ggplot(train_results, aes(x = date)) +
+  geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
+  geom_line(aes(y = forecasted, color = "Ridge Forecast"), linewidth = 0.8, linetype = "dashed") +
+  labs(
+    title = "Ridge Regression: Forecasted vs Actual Returns (Training Set)",
+    x = "Date",
+    y = "Log Return",
+    color = "Series"
+  ) +
+  scale_color_manual(values = c("Actual" = "steelblue", "Ridge Forecast" = "coral")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+# ---- Scatter plot: Training set Forecasted vs Actual ----
+
+# Compute training metrics for display
+mae_train <- mae(y_train, y_pred_train)
+rmse_train <- rmse(y_train, y_pred_train)
+r2_train <- cor(y_train, y_pred_train)^2
+
+ggplot(train_results, aes(x = actual, y = forecasted)) +
+  geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Ridge Regression: Training Set Forecast Accuracy",
+    x = "Actual Return",
+    y = "Forecasted Return",
+    subtitle = paste("R² =", round(r2_train, 4), "| RMSE =", round(rmse_train, 6))
+  ) +
+  theme_minimal() +
+  coord_fixed(ratio = 1)
+
+```
 
 ```
