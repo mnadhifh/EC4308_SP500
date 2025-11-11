@@ -1,8 +1,8 @@
 ---
-title: "LASSO Regression"
+title: "Lasso Regression"
 author: "marth"
 output: html_document
-date: "2025-11-11"
+date: "2025-11-10"
 ---
 
 ```{r setup, include=FALSE}
@@ -26,55 +26,84 @@ data_mean = read.csv("../data/prevail_mean.csv")
 data$date <- as.Date(data$date)
 data_mean$date <- as.Date(data_mean$date)
 
+# ============================================================================
+# CREATE MULTI-HORIZON TARGET VARIABLES
+# ============================================================================
+# We want to forecast 3-month, 6-month, and 12-month ahead returns
+# 6-month = sum of 2 consecutive quarters
+# 12-month = sum of 4 consecutive quarters
+
+data <- data %>%
+  arrange(date) %>%
+  mutate(
+    # Create lead log returns for each horizon
+    log_ret_lead_3m = lead(log_ret, 1),           # 3-month ahead (1 quarter)
+    log_ret_lead_6m = lead(log_ret, 1) + lead(log_ret, 2),  # 6-month ahead (2 quarters)
+    log_ret_lead_12m = lead(log_ret, 1) + lead(log_ret, 2) + lead(log_ret, 3) + lead(log_ret, 4)  # 12-month ahead (4 quarters)
+  )
+
+# ============================================================================
+# CREATE LAGGED VARIABLES FOR MULTI-HORIZON TARGETS
+# ============================================================================
+# Create 5 lags for each horizon's returns
+
+# Lags for 3-month returns
+data <- data %>%
+  mutate(
+    log_ret_3m_L1 = lag(log_ret_lead_3m, 1),
+    log_ret_3m_L2 = lag(log_ret_lead_3m, 2),
+    log_ret_3m_L3 = lag(log_ret_lead_3m, 3),
+    log_ret_3m_L4 = lag(log_ret_lead_3m, 4),
+    log_ret_3m_L5 = lag(log_ret_lead_3m, 5)
+  )
+
+# ============================================================================
+# SELECT FINAL FEATURES FOR MODELING
+# ============================================================================
+
 data <- data %>%
   select(
     date,
     log_ret,
-    matches("_L[1-4]$")       # only lagged features
-  ) %>%
-  select(-matches("price")) %>% 
-  left_join(
-    data_mean %>% select(date, mean_prevailing_ret),
-    by = "date"
+    # Multi-horizon targets
+    log_ret_lead_3m,
+    log_ret_lead_6m,
+    log_ret_lead_12m,
+    # All lagged y's for 3-month horizon
+    matches("^log_ret_3m_L"),
+    # ALL lagged x variables (L2-L5 only to avoid leakage with 1-quarter lead)
+    matches("_L[2-5]$")
   )
 
-```
-
-## LASSO Regression Model
+cat("\n=== Multi-Horizon Target Variables Created ===\n")
+cat("✓ log_ret_lead_3m: 3-month ahead returns (1 quarter)\n")
+cat("✓ log_ret_lead_6m: 6-month ahead returns (sum of 2 quarters)\n")
+cat("✓ log_ret_lead_12m: 12-month ahead returns (sum of 4 quarters)\n")
+cat("✓ 5 lags created for each horizon\n")
 
 # ============================================================================
-# MODELING APPROACH: 80/20 Train-Test Split w/ Recursive CV
+# DIAGNOSTIC: Show all available columns with lag variables
 # ============================================================================
 
-```{r}
-# --- STEP 1: Prepare data ---
+cat("\n=== All Columns in Data ===\n")
+all_cols <- colnames(data)
+cat("Total columns:", length(all_cols), "\n")
+cat("Columns:", paste(all_cols, collapse = ", "), "\n")
 
-lasso_df <- data %>%
-  arrange(date) %>%
-  select(-mean_prevailing_ret) %>%
-  drop_na()
+cat("\n=== Lag Columns (containing _L2, _L3, _L4, or _L5) ===\n")
+lag_cols <- grep("_L[2-5]$", all_cols, value = TRUE)
+cat("Total lag variables (L2-L5):", length(lag_cols), "\n")
+print(lag_cols)
 
-set.seed(123)
+cat("\n=== 3-month Horizon Lag Columns ===\n")
+lag_3m <- grep("^log_ret_3m_L", all_cols, value = TRUE)
+cat("Total 3m lag variables:", length(lag_3m), "\n")
+print(lag_3m)
 
-n <- nrow(lasso_df)
-train_size <- floor(0.8 * n)  # 80% training
-test_size <- n - train_size   # 20% testing
-
-cat("\n=== Data Split ===\n")
-cat("Training:", train_size, "observations\n")
-cat("Testing :", test_size, "observations\n")
-
-train_data <- lasso_df[1:train_size, ]
-test_data  <- lasso_df[(train_size + 1):n, ]
-
-# Extract features and target
-X_train <- train_data %>% select(-date, -log_ret) %>% as.matrix()
-y_train <- train_data$log_ret
-
-X_test <- test_data %>% select(-date, -log_ret) %>% as.matrix()
-y_test <- test_data$log_ret
-
-cat("\nFeatures in model:", ncol(X_train), "\n")
+cat("\n=== FEATURE SUMMARY ===\n")
+cat("log_ret_3m_L* (3m horizon lags):", length(lag_3m), "\n")
+cat("_L[2-5]$ (all L2-L5 variables):", length(lag_cols), "\n")
+cat("TOTAL FEATURES FOR MODELING:", length(lag_3m) + length(lag_cols), "\n")
 
 ```
 
@@ -86,15 +115,17 @@ cat("\nFeatures in model:", ncol(X_train), "\n")
 # BIC(λ) = log(RSS(λ)) + (log(T)/T)·df(λ)
 # ============================================================================
 
-# Function 1: Compute degrees of freedom for LASSO
-# df(λ) = number of non-zero coefficients
-compute_lasso_df <- function(coef_matrix) {
-  # Count non-zero coefficients (excluding intercept)
-  df <- sum(coef_matrix != 0)
+# Function 1: Compute degrees of freedom for Lasso Regression
+# For Lasso: df(λ) ≈ number of non-zero coefficients (excluding intercept)
+compute_lasso_df <- function(fit_object, lambda) {
+  # Get coefficients at this lambda
+  coefs <- coef(fit_object, s = lambda)
+  # df = number of non-zero coefficients (excluding intercept)
+  df <- sum(coefs[-1] != 0)
   return(df)
 }
 
-# Function 2: Fit LASSO Regression and compute BIC for each lambda
+# Function 2: Fit Lasso Regression and compute BIC for each lambda
 fit_lasso_bic <- function(X, y, alpha = 1, lambdas = NULL) {
   
   # ---- Input validation ----
@@ -103,7 +134,7 @@ fit_lasso_bic <- function(X, y, alpha = 1, lambdas = NULL) {
   if (length(y) != T) stop("X and y must have same number of rows")
   if (!is.matrix(X)) X <- as.matrix(X)
   
-  # Fit glmnet (lasso: alpha=1, standardize=TRUE, intercept=TRUE)
+  # Fit glmnet (Lasso: alpha=1, standardize=TRUE, intercept=TRUE)
   fit <- glmnet(X, y, alpha = alpha, standardize = TRUE, intercept = TRUE, 
                 lambda = lambdas, thresh = 1e-7)
   
@@ -115,9 +146,9 @@ fit_lasso_bic <- function(X, y, alpha = 1, lambdas = NULL) {
   RSS_vec <- colSums((y - y_pred_matrix)^2)
   
   # ---- Compute degrees of freedom for each lambda ----
-  # For LASSO: df = number of non-zero coefficients
-  coef_matrix <- coef(fit)[-1, ]  # exclude intercept
-  df_vec <- colSums(coef_matrix != 0)
+  df_vec <- sapply(fit$lambda, function(lam) {
+    compute_lasso_df(fit, lam)
+  })
   
   # ---- Compute BIC: log(RSS) + (log(T)/T) * df ----
   bic_penalty <- log(T) / T
@@ -153,12 +184,12 @@ select_lambda_bic <- function(X, y, alpha = 1, lambdas = NULL) {
     lambdas <- 10^seq(5, -2, length.out = 100)
   }
   
-  if (alpha == 1) {
-    # LASSO Regression
+  if (alpha == 0) {
+    # Ridge Regression (not used here)
+    stop("Use alpha=1 for Lasso. For Ridge, use ridge_regression.Rmd")
+  } else if (alpha == 1) {
+    # LASSO
     result <- fit_lasso_bic(X, y, alpha = 1, lambdas = lambdas)
-  } else if (alpha == 0) {
-    # Ridge (not implemented here, but structure ready)
-    stop("Ridge not implemented in this file. Use alpha=1 for LASSO.")
   } else {
     stop("alpha must be 0 (Ridge) or 1 (LASSO)")
   }
@@ -168,98 +199,288 @@ select_lambda_bic <- function(X, y, alpha = 1, lambdas = NULL) {
 
 ```
 
-## Example: LASSO Regression with BIC Lambda Selection
+## Build Lasso Models for Each Horizon
 
 ```{r}
-# ---- Fit LASSO Regression using BIC for lambda selection ----
+# ---- Fit Lasso Regression Models for Each Horizon (3m, 6m, 12m) ----
+# Each horizon gets its own independent BIC optimization
 
-# Generate lambda sequence (smaller range)
-lambdas <- 10^seq(2, -5, length.out = 50)
+# Lambda sequence for BIC optimization
+lambdas <- 10^seq(3, -1, length.out = 50)
 
-# Fit lasso with BIC
-lasso_result <- select_lambda_bic(X_train, y_train, alpha = 1, lambdas = lambdas)
+# Store results for each horizon
+lasso_results <- list()
 
-cat("\n=== LASSO Regression: BIC-based Lambda Selection ===\n")
-cat("Optimal λ:", round(lasso_result$lambda_best, 6), "\n")
-cat("Training size (T):", nrow(X_train), "\n")
+# Loop through each horizon
+for (horizon in c("3m", "6m", "12m")) {
+  cat("\n========== HORIZON:", horizon, "==========\n")
+  
+  # Extract datasets for this horizon (horizon-specific features only)
+  X_train_h <- get(paste0("X_train_", horizon))
+  y_train_h <- get(paste0("y_train_", horizon))
+  X_test_h <- get(paste0("X_test_", horizon))
+  y_test_h <- get(paste0("y_test_", horizon))
+  
+  cat("Features for", horizon, "horizon:", ncol(X_train_h), "variables\n")
+  cat("Sample features:", paste(colnames(X_train_h)[seq_len(min(3, ncol(X_train_h)))], collapse = ", "), "\n")
+  
+  # Fit Lasso regression with BIC lambda selection
+  # BIC optimization is done INDEPENDENTLY for each horizon
+  lasso_fit <- select_lambda_bic(X_train_h, y_train_h, 
+                                 alpha = 1, 
+                                 lambdas = lambdas)
+  
+  # Store the result
+  lasso_results[[horizon]] <- lasso_fit
+  
+  # Extract optimal lambda and model
+  lambda_opt <- lasso_fit$lambda_best
+  fit_glmnet <- lasso_fit$fit
+  
+  cat("\nOptimal lambda (BIC) for", horizon, ":", lambda_opt, "\n")
+  cat("Top 10 BIC values:\n")
+  print(head(lasso_fit$bic_tbl, 10))
+  
+  # Make predictions on test set
+  y_pred_test <- as.vector(predict(fit_glmnet, newx = X_test_h, s = lambda_opt))
+  
+  # Make predictions on training set
+  y_pred_train <- as.vector(predict(fit_glmnet, newx = X_train_h, s = lambda_opt))
+  
+  # Compute test metrics (RMSE = sqrt(mean(squared errors)))
+  rmse_test <- sqrt(mean((y_test_h - y_pred_test)^2))
+  
+  # Compute training metrics
+  rmse_train <- sqrt(mean((y_train_h - y_pred_train)^2))
+  
+  # Display metrics
+  cat("\nTest Set Metrics:\n")
+  cat("  RMSE:", rmse_test, "\n")
+  
+  cat("\nTraining Set Metrics:\n")
+  cat("  RMSE:", rmse_train, "\n")
+  
+  # Extract coefficients
+  coefficients <- as.vector(coef(fit_glmnet, s = lambda_opt))
+  
+  # Create results dataframe for test predictions
+  test_results <- data.frame(
+    actual = y_test_h,
+    predicted = y_pred_test,
+    residual = y_test_h - y_pred_test,
+    abs_error = abs(y_test_h - y_pred_test)
+  )
+  
+  # Create results dataframe for training predictions
+  train_results <- data.frame(
+    actual = y_train_h,
+    predicted = y_pred_train,
+    residual = y_train_h - y_pred_train,
+    abs_error = abs(y_train_h - y_pred_train)
+  )
+  
+  # Create metrics summary
+  metrics_summary <- data.frame(
+    Horizon = horizon,
+    Dataset = c("Training", "Test"),
+    RMSE = c(rmse_train, rmse_test),
+    Lambda_Optimal = lambda_opt,
+    N_NonZero_Coefs = sum(coefficients[-1] != 0)  # Exclude intercept
+  )
+  
+  # Store results and metrics in lists for later visualization
+  lasso_results[[horizon]]$train_results <- train_results
+  lasso_results[[horizon]]$test_results <- test_results
+  lasso_results[[horizon]]$metrics_summary <- metrics_summary
+  lasso_results[[horizon]]$train_data_dates <- train_data$date
+  lasso_results[[horizon]]$test_data_dates <- test_data$date
+  
+  cat("\n")
+}
 
-# Display top 10 lambdas by BIC
-top_bics <- lasso_result$bic_tbl %>%
-  arrange(BIC) %>%
-  head(10)
+cat("\n========== LASSO REGRESSION MODELS COMPLETE ==========\n")
 
-cat("\nTop 10 λ values by BIC:\n")
-print(top_bics)
+# Create cross-horizon summary
+cat("\nCross-Horizon Summary:\n")
+summary_list <- lapply(c("3m", "6m", "12m"), function(horizon) {
+  lasso_results[[horizon]]$metrics_summary
+})
+summary_table <- do.call(rbind, summary_list)
+print(summary_table)
+
+```
+
+## Visualizations: Lasso Regression Results for Each Horizon
+
+```{r}
+# ---- Visualize Test Set: Forecasted vs Actual for Each Horizon ----
+
+for (horizon in c("3m", "6m", "12m")) {
+  
+  test_results <- lasso_results[[horizon]]$test_results
+  test_dates <- lasso_results[[horizon]]$test_data_dates
+  
+  # Add dates to results
+  test_results$date <- test_dates
+  
+  metrics <- lasso_results[[horizon]]$metrics_summary
+  test_metrics <- metrics[metrics$Dataset == "Test", ]
+  
+  # Line plot: Forecasted vs Actual for test set
+  p <- ggplot(test_results, aes(x = date)) +
+    geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
+    geom_line(aes(y = predicted, color = "Lasso Forecast"), linewidth = 0.8, linetype = "dashed") +
+    labs(
+      title = paste("Lasso Regression:", toupper(horizon), "Horizon - Test Set"),
+      x = "Date",
+      y = "Log Return",
+      color = "Series",
+      subtitle = paste("RMSE =", round(test_metrics$RMSE, 4))
+    ) +
+    scale_color_manual(values = c("Actual" = "steelblue", "Lasso Forecast" = "coral")) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p)
+}
 
 ```
 
 ```{r}
-# ---- Predict on test set ----
+# ---- Visualize Training Set: Forecasted vs Actual for Each Horizon ----
 
-# Extract the fitted model
-fit <- lasso_result$fit
-lambda_opt <- lasso_result$lambda_best
-
-# Predict on test data
-y_pred_test <- predict(fit, newx = X_test, s = lambda_opt)
-
-# Compute test metrics
-mae_lasso <- mae(y_test, y_pred_test)
-rmse_lasso <- rmse(y_test, y_pred_test)
-r2_lasso <- cor(y_test, y_pred_test)^2
-
-cat("\n=== LASSO Regression Test Performance ===\n")
-cat("MAE :", round(mae_lasso, 6), "\n")
-cat("RMSE:", round(rmse_lasso, 6), "\n")
-cat("R²  :", round(r2_lasso, 4), "\n")
-
-```
-
-```{r}
-# ---- Visualize BIC curve ----
-
-ggplot(lasso_result$bic_tbl, aes(x = log10(lambda), y = BIC)) +
-  geom_line(color = "steelblue") +
-  geom_point(data = lasso_result$bic_tbl %>% filter(is_best), 
-             color = "red", size = 3) +
-  labs(
-    title = "LASSO Regression: BIC vs Log10(λ)",
-    x = "Log10(λ)",
-    y = "BIC",
-    subtitle = paste("Optimal λ =", round(lasso_result$lambda_best, 6))
-  ) +
-  theme_minimal() +
-  theme(plot.subtitle = element_text(face = "italic"))
+for (horizon in c("3m", "6m", "12m")) {
+  
+  train_results <- lasso_results[[horizon]]$train_results
+  train_dates <- lasso_results[[horizon]]$train_data_dates
+  
+  # Add dates to results
+  train_results$date <- train_dates
+  
+  metrics <- lasso_results[[horizon]]$metrics_summary
+  train_metrics <- metrics[metrics$Dataset == "Training", ]
+  
+  # Line plot: Forecasted vs Actual for training set
+  p <- ggplot(train_results, aes(x = date)) +
+    geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
+    geom_line(aes(y = predicted, color = "Lasso Forecast"), linewidth = 0.8, linetype = "dashed") +
+    labs(
+      title = paste("Lasso Regression:", toupper(horizon), "Horizon - Training Set"),
+      x = "Date",
+      y = "Log Return",
+      color = "Series",
+      subtitle = paste("RMSE =", round(train_metrics$RMSE, 4))
+    ) +
+    scale_color_manual(values = c("Actual" = "steelblue", "Lasso Forecast" = "coral")) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p)
+}
 
 ```
 
 ```{r}
-# ---- Extract and display coefficients ----
+# ---- Scatter Plots: Forecast Accuracy for Each Horizon (Test Set) ----
 
-# Get coefficients at optimal lambda
-coefs <- coef(fit, s = lambda_opt)
+for (horizon in c("3m", "6m", "12m")) {
+  
+  test_results <- lasso_results[[horizon]]$test_results
+  metrics <- lasso_results[[horizon]]$metrics_summary
+  test_metrics <- metrics[metrics$Dataset == "Test", ]
+  
+  p <- ggplot(test_results, aes(x = actual, y = predicted)) +
+    geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+    labs(
+      title = paste("Lasso Regression:", toupper(horizon), "Horizon - Test Set Accuracy"),
+      x = "Actual Return",
+      y = "Forecasted Return",
+      subtitle = paste("RMSE =", round(test_metrics$RMSE, 4))
+    ) +
+    theme_minimal() +
+    coord_fixed(ratio = 1)
+  
+  print(p)
+}
 
-# Convert to data frame for better display
-coefs_df <- data.frame(
-  feature = rownames(coefs),
-  coefficient = as.numeric(coefs)
+```
+
+## Store Lasso Regression Results
+
+```{r}
+# ---- Combine Results Across All Horizons ----
+
+cat("\n========== STORING LASSO REGRESSION RESULTS ==========\n")
+
+# Get dates for train and test sets
+train_dates <- train_data$date
+test_dates <- test_data$date
+
+# Initialize combined dataframes
+lasso_train_combined <- data.frame(
+  date = train_dates,
+  actual_3m = y_train_3m,
+  predicted_3m = lasso_results[["3m"]]$train_results$predicted,
+  actual_6m = y_train_6m,
+  predicted_6m = lasso_results[["6m"]]$train_results$predicted,
+  actual_12m = y_train_12m,
+  predicted_12m = lasso_results[["12m"]]$train_results$predicted
 )
 
-# Extract and display intercept
-intercept <- coefs_df %>% filter(feature == "(Intercept)") %>% pull(coefficient)
+lasso_test_combined <- data.frame(
+  date = test_dates,
+  actual_3m = y_test_3m,
+  predicted_3m = lasso_results[["3m"]]$test_results$predicted,
+  actual_6m = y_test_6m,
+  predicted_6m = lasso_results[["6m"]]$test_results$predicted,
+  actual_12m = y_test_12m,
+  predicted_12m = lasso_results[["12m"]]$test_results$predicted
+)
 
-cat("\n=== LASSO Regression Intercept (λ =", round(lambda_opt, 6), ") ===\n")
-cat("Intercept:", round(intercept, 8), "\n")
+# Save to CSV
+write.csv(lasso_train_combined, "../data/lasso_train_predictions.csv", row.names = FALSE)
+write.csv(lasso_test_combined, "../data/lasso_test_predictions.csv", row.names = FALSE)
 
-# Remove intercept row for feature coefficients display
-coefs_df <- coefs_df %>% filter(feature != "(Intercept)")
+cat("\n=== Results Saved ===\n")
+cat("✓ Training predictions saved to: ../data/lasso_train_predictions.csv\n")
+cat("✓ Test predictions saved to: ../data/lasso_test_predictions.csv\n")
+cat("✓ Columns: date, actual_3m, predicted_3m, actual_6m, predicted_6m, actual_12m, predicted_12m\n")
 
-# Sort by absolute value for easier interpretation
-coefs_df <- coefs_df %>%
-  mutate(abs_coef = abs(coefficient)) %>%
-  arrange(desc(abs_coef))
+# Display sample of results
+cat("\n=== Training Set Results (First 5 rows) ===\n")
+print(head(lasso_train_combined, 5))
 
-cat("\n=== LASSO Regression Coefficients (λ =", round(lambda_opt, 6), ") ===\n")
+cat("\n=== Test Set Results (First 5 rows) ===\n")
+print(head(lasso_test_combined, 5))
+
+```
+
+```{r}
+# ---- Scatter Plots: Forecast Accuracy for Each Horizon (Training Set) ----
+
+for (horizon in c("3m", "6m", "12m")) {
+  
+  train_results <- lasso_results[[horizon]]$train_results
+  metrics <- lasso_results[[horizon]]$metrics_summary
+  train_metrics <- metrics[metrics$Dataset == "Training", ]
+  
+  p <- ggplot(train_results, aes(x = actual, y = predicted)) +
+    geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+    labs(
+      title = paste("Lasso Regression:", toupper(horizon), "Horizon - Training Set Accuracy"),
+      x = "Actual Return",
+      y = "Forecasted Return",
+      subtitle = paste("RMSE =", round(train_metrics$RMSE, 4))
+    ) +
+    theme_minimal() +
+    coord_fixed(ratio = 1)
+  
+  print(p)
+}
+
+```
 cat("Number of non-zero coefficients:", sum(coefs_df$coefficient != 0), "\n")
 print(coefs_df)
 
