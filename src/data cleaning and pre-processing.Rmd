@@ -144,7 +144,7 @@ data_merged <- data_merged %>% select(-any_of(nonstationary_vars))
 ## Adding Lags
 ``` {r}
 
-predictors <- setdiff(names(data_merged), c("date", "log_ret"))
+predictors <- setdiff(names(data_merged), c("date"))
 
 # we choose to add 5 lags 
 for (v in predictors) {
@@ -154,7 +154,7 @@ for (v in predictors) {
 }
 
 # remove NAs introduced by adding lags
-data_merged <- data_merged %>% filter(row_number() > 5)
+data_merged <- data_merged %>% filter(row_number() > 6)
 
 sum(is.na(data_merged))
 #colSums(is.na(data_merged))

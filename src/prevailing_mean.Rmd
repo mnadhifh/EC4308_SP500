@@ -24,6 +24,7 @@ data = read.csv("../data/data_merged.csv")  %>%
     date,
     log_ret,
     matches("^price_fd_L[1-5]$"),
+    matches("^log_ret_L[1-5]$"),
     matches("_L[2-5]$")       # only lagged features from at least 2 periods ago
   ) 
 
