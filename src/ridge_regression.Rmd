@@ -496,31 +496,6 @@ for (horizon in c("3m", "6m", "12m")) {
 
 ```
 
-```{r}
-# ---- Scatter Plots: Forecast Accuracy for Each Horizon (Test Set) ----
-
-for (horizon in c("3m", "6m", "12m")) {
-  
-  test_results <- ridge_results[[horizon]]$test_results
-  metrics <- ridge_results[[horizon]]$metrics_summary
-  test_metrics <- metrics[metrics$Dataset == "Test", ]
-  
-  p <- ggplot(test_results, aes(x = actual, y = predicted)) +
-    geom_point(alpha = 0.6, color = "steelblue", size = 2) +
-    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
-    labs(
-      title = paste("Ridge Regression:", toupper(horizon), "Horizon - Test Set Accuracy"),
-      x = "Actual Return",
-      y = "Forecasted Return",
-      subtitle = paste("RMSE =", round(test_metrics$RMSE, 4))
-    ) +
-    theme_minimal() +
-    coord_fixed(ratio = 1)
-  
-  print(p)
-}
-
-```
 
 ## Store Ridge Regression Results
 
@@ -572,36 +547,17 @@ print(head(ridge_test_combined, 5))
 
 ```
 
-```{r}
-# ---- Scatter Plots: Forecast Accuracy for Each Horizon (Training Set) ----
-
-for (horizon in c("3m", "6m", "12m")) {
-  
-  train_results <- ridge_results[[horizon]]$train_results
-  metrics <- ridge_results[[horizon]]$metrics_summary
-  train_metrics <- metrics[metrics$Dataset == "Training", ]
-  
-  p <- ggplot(train_results, aes(x = actual, y = predicted)) +
-    geom_point(alpha = 0.6, color = "steelblue", size = 2) +
-    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
-    labs(
-      title = paste("Ridge Regression:", toupper(horizon), "Horizon - Training Set Accuracy"),
-      x = "Actual Return",
-      y = "Forecasted Return",
-      subtitle = paste("RMSE =", round(train_metrics$RMSE, 4))
-    ) +
-    theme_minimal() +
-    coord_fixed(ratio = 1)
-  
-  print(p)
-}
-
-```
 
 ## Example: Ridge Regression with BIC Lambda Selection
 
 ```{r}
-# ---- Fit Ridge Regression using BIC for lambda selection ----
+# ---- Fit Ridge Regression using BIC for lambda selection (using 3m horizon as example) ----
+
+# Use 3-month horizon data as example
+X_train <- X_train_3m
+y_train <- y_train_3m
+X_test <- X_test_3m
+y_test <- y_test_3m
 
 # Generate lambda sequence (smaller grid)
 lambdas <- 10^seq(5, -2, length.out = 100)
@@ -609,7 +565,7 @@ lambdas <- 10^seq(5, -2, length.out = 100)
 # Fit ridge with BIC
 ridge_result <- select_lambda_bic(X_train, y_train, alpha = 0, lambdas = lambdas)
 
-cat("\n=== Ridge Regression: BIC-based Lambda Selection ===\n")
+cat("\n=== Ridge Regression: BIC-based Lambda Selection (3m Horizon Example) ===\n")
 cat("Optimal λ:", round(ridge_result$lambda_best, 6), "\n")
 cat("Training size (T):", nrow(X_train), "\n")
 
@@ -624,7 +580,7 @@ print(top_bics)
 ```
 
 ```{r}
-# ---- Predict on test set ----
+# ---- Predict on test set (3m horizon example) ----
 
 # Extract the fitted model
 fit <- ridge_result$fit
@@ -638,10 +594,44 @@ mae_ridge <- mae(y_test, y_pred_test)
 rmse_ridge <- rmse(y_test, y_pred_test)
 r2_ridge <- cor(y_test, y_pred_test)^2
 
-cat("\n=== Ridge Regression Test Performance ===\n")
+cat("\n=== Ridge Regression Test Performance (3m Horizon Example) ===\n")
 cat("MAE :", round(mae_ridge, 6), "\n")
 cat("RMSE:", round(rmse_ridge, 6), "\n")
 cat("R²  :", round(r2_ridge, 4), "\n")
+
+```
+
+```{r}
+# ---- Test Performance for ALL Horizons ----
+
+cat("\n========== TEST PERFORMANCE FOR ALL HORIZONS ==========\n\n")
+
+for (horizon in c("3m", "6m", "12m")) {
+  
+  X_test_h <- get(paste0("X_test_", horizon))
+  y_test_h <- get(paste0("y_test_", horizon))
+  
+  # Get the fitted model for this horizon
+  ridge_fit_h <- ridge_results[[horizon]]
+  fit_h <- ridge_fit_h$fit
+  lambda_opt_h <- ridge_fit_h$lambda_best
+  
+  # Predict on test data
+  y_pred_test_h <- predict(fit_h, newx = X_test_h, s = lambda_opt_h)
+  
+  # Compute test metrics
+  mae_h <- mae(y_test_h, y_pred_test_h)
+  rmse_h <- rmse(y_test_h, y_pred_test_h)
+  r2_h <- cor(y_test_h, y_pred_test_h)^2
+  
+  cat("\n--- Horizon:", horizon, "---\n")
+  cat("Optimal λ:", round(lambda_opt_h, 6), "\n")
+  cat("MAE :", round(mae_h, 6), "\n")
+  cat("RMSE:", round(rmse_h, 6), "\n")
+  cat("R²  :", round(r2_h, 4), "\n")
+}
+
+cat("\n========== END TEST PERFORMANCE SUMMARY ==========\n")
 
 ```
 
@@ -711,141 +701,255 @@ ggplot(coefs_df, aes(x = reorder(feature, coefficient), y = coefficient, fill = 
 ```
 
 ```{r}
-# ---- Visualize forecasted vs actual returns on test set ----
+# ---- Visualize BIC curves for ALL Horizons ----
 
-# Create a data frame for plotting
-test_results <- data.frame(
-  date = test_data$date,
-  actual = y_test,
-  forecasted = as.numeric(y_pred_test),
-  obs_num = seq_along(y_test)
-)
+cat("\n========== VISUALIZING BIC CURVES FOR ALL HORIZONS ==========\n\n")
 
-# Line plot: Forecasted vs Actual
-ggplot(test_results, aes(x = date)) +
-  geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
-  geom_line(aes(y = forecasted, color = "Ridge Forecast"), linewidth = 0.8, linetype = "dashed") +
-  labs(
-    title = "Ridge Regression: Forecasted vs Actual Returns (Test Set)",
-    x = "Date",
-    y = "Log Return",
-    color = "Series"
-  ) +
-  scale_color_manual(values = c("Actual" = "steelblue", "Ridge Forecast" = "coral")) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
+for (horizon in c("3m", "6m", "12m")) {
+  
+  ridge_fit_h <- ridge_results[[horizon]]
+  
+  p <- ggplot(ridge_fit_h$bic_tbl, aes(x = log10(lambda), y = BIC)) +
+    geom_line(color = "steelblue") +
+    geom_point(data = ridge_fit_h$bic_tbl %>% filter(is_best), 
+               color = "red", size = 3) +
+    labs(
+      title = paste("Ridge Regression - BIC Curve:", toupper(horizon), "Horizon"),
+      x = "Log10(λ)",
+      y = "BIC",
+      subtitle = paste("Optimal λ =", round(ridge_fit_h$lambda_best, 6))
+    ) +
+    theme_minimal() +
+    theme(plot.subtitle = element_text(face = "italic"))
+  
+  print(p)
+}
 
-```
-
-```{r}
-# ---- Scatter plot: Forecasted vs Actual ----
-
-ggplot(test_results, aes(x = actual, y = forecasted)) +
-  geom_point(alpha = 0.6, color = "steelblue", size = 2) +
-  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
-  labs(
-    title = "Ridge Regression: Forecast Accuracy (Test Set)",
-    x = "Actual Return",
-    y = "Forecasted Return",
-    subtitle = paste("R² =", round(r2_ridge, 4), "| RMSE =", round(rmse_ridge, 6))
-  ) +
-  theme_minimal() +
-  coord_fixed(ratio = 1)
+cat("\n========== END BIC CURVES ==========\n")
 
 ```
 
 ```{r}
-# ---- Save Ridge Regression Predictions and Results ----
+# ---- Visualize forecasted vs actual returns on test set (ALL HORIZONS) ----
 
-# Create results dataframe with TRAINING predictions
-y_pred_train <- predict(fit, newx = X_train, s = lambda_opt)
+cat("\n========== LINE PLOTS: FORECASTED VS ACTUAL (TEST SET) ==========\n\n")
 
-ridge_train_predictions <- data.frame(
-  date = train_data$date,
-  ridge_actual = y_train,
-  ridge_forecast = as.numeric(y_pred_train)
-)
-
-# Save training predictions to CSV
-write.csv(ridge_train_predictions, "../data/ridge_train_predictions.csv", row.names = FALSE)
-
-# Create results dataframe with TEST predictions
-ridge_predictions <- test_results %>%
-  select(date, actual, forecasted) %>%
-  rename(
-    ridge_forecast = forecasted,
-    ridge_actual = actual
+for (horizon in c("3m", "6m", "12m")) {
+  
+  X_test_h <- get(paste0("X_test_", horizon))
+  y_test_h <- get(paste0("y_test_", horizon))
+  
+  # Get the fitted model for this horizon
+  ridge_fit_h <- ridge_results[[horizon]]
+  fit_h <- ridge_fit_h$fit
+  lambda_opt_h <- ridge_fit_h$lambda_best
+  
+  # Predict on test data
+  y_pred_test_h <- predict(fit_h, newx = X_test_h, s = lambda_opt_h)
+  
+  # Create a data frame for plotting
+  test_results_h <- data.frame(
+    date = test_data$date,
+    actual = y_test_h,
+    forecasted = as.numeric(y_pred_test_h),
+    obs_num = seq_along(y_test_h)
   )
+  
+  # Line plot: Forecasted vs Actual
+  p <- ggplot(test_results_h, aes(x = date)) +
+    geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
+    geom_line(aes(y = forecasted, color = "Ridge Forecast"), linewidth = 0.8, linetype = "dashed") +
+    labs(
+      title = paste("Ridge Regression - Forecasted vs Actual:", toupper(horizon), "Horizon (Test Set)"),
+      x = "Date",
+      y = "Log Return",
+      color = "Series"
+    ) +
+    scale_color_manual(values = c("Actual" = "steelblue", "Ridge Forecast" = "coral")) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p)
+}
 
-# Save test predictions to CSV
-write.csv(ridge_predictions, "../data/ridge_predictions.csv", row.names = FALSE)
+cat("\n========== END LINE PLOTS ==========\n")
 
-# Save model evaluation metrics
-ridge_metrics <- data.frame(
-  model = "Ridge Regression",
-  optimal_lambda = ridge_result$lambda_best,
-  MAE = mae_ridge,
-  RMSE = rmse_ridge,
-  R2 = r2_ridge
-)
+```
 
-# write.csv(ridge_metrics, "../data/ridge_metrics.csv", row.names = FALSE)
+```{r}
+# ---- Scatter plots: Forecasted vs Actual (ALL HORIZONS) ----
 
-# Save BIC table
-# write.csv(ridge_result$bic_tbl, "../data/ridge_bic_table.csv", row.names = FALSE)
+cat("\n========== SCATTER PLOTS: FORECAST ACCURACY (TEST SET) ==========\n\n")
 
-cat("\n=== Ridge Regression Results Saved ===\n")
+for (horizon in c("3m", "6m", "12m")) {
+  
+  X_test_h <- get(paste0("X_test_", horizon))
+  y_test_h <- get(paste0("y_test_", horizon))
+  
+  # Get the fitted model for this horizon
+  ridge_fit_h <- ridge_results[[horizon]]
+  fit_h <- ridge_fit_h$fit
+  lambda_opt_h <- ridge_fit_h$lambda_best
+  
+  # Predict on test data
+  y_pred_test_h <- predict(fit_h, newx = X_test_h, s = lambda_opt_h)
+  
+  # Compute metrics
+  mae_h <- mae(y_test_h, y_pred_test_h)
+  rmse_h <- rmse(y_test_h, y_pred_test_h)
+  r2_h <- cor(y_test_h, y_pred_test_h)^2
+  
+  # Create scatter plot
+  test_results_h <- data.frame(
+    actual = y_test_h,
+    forecasted = as.numeric(y_pred_test_h)
+  )
+  
+  p <- ggplot(test_results_h, aes(x = actual, y = forecasted)) +
+    geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+    labs(
+      title = paste("Ridge Regression - Forecast Accuracy:", toupper(horizon), "Horizon (Test Set)"),
+      x = "Actual Return",
+      y = "Forecasted Return",
+      subtitle = paste("R² =", round(r2_h, 4), "| RMSE =", round(rmse_h, 6), "| MAE =", round(mae_h, 6))
+    ) +
+    theme_minimal() +
+    coord_fixed(ratio = 1)
+  
+  print(p)
+}
+
+cat("\n========== END SCATTER PLOTS ==========\n")
+
+```
+
+```{r}
+# ---- Save Ridge Regression Predictions and Results (Multi-Horizon) ----
+
+cat("\n========== SAVING MULTI-HORIZON RIDGE PREDICTIONS ==========\n\n")
+
+# Already saved earlier: ridge_train_combined and ridge_test_combined
+# These contain all horizons (3m, 6m, 12m) predictions
+
 cat("✓ Training predictions saved to: ../data/ridge_train_predictions.csv\n")
-cat("✓ Test predictions saved to: ../data/ridge_predictions.csv\n")
-cat("✓ Metrics saved to: ../data/ridge_metrics.csv\n")
-cat("✓ BIC table saved to: ../data/ridge_bic_table.csv\n")
+cat("✓ Test predictions saved to: ../data/ridge_test_predictions.csv\n")
+cat("✓ Columns: date, actual_3m, predicted_3m, actual_6m, predicted_6m, actual_12m, predicted_12m\n\n")
+
+# Display summary statistics for each horizon
+for (horizon in c("3m", "6m", "12m")) {
+  
+  actual_col <- paste0("actual_", horizon)
+  predicted_col <- paste0("predicted_", horizon)
+  
+  actual_vals <- ridge_test_combined[[actual_col]]
+  pred_vals <- ridge_test_combined[[predicted_col]]
+  
+  mae_h <- mae(actual_vals, pred_vals)
+  rmse_h <- rmse(actual_vals, pred_vals)
+  r2_h <- cor(actual_vals, pred_vals)^2
+  
+  cat("Horizon:", horizon, "\n")
+  cat("  MAE :", round(mae_h, 6), "\n")
+  cat("  RMSE:", round(rmse_h, 6), "\n")
+  cat("  R²  :", round(r2_h, 4), "\n\n")
+}
+
+cat("========== END SAVING SUMMARY ==========\n")
 
 ```
 
 ```{r}
-# ---- Visualize training set: Forecasted vs Actual ----
+# ---- Visualize training set: Forecasted vs Actual (ALL HORIZONS) ----
 
-# Create a data frame for training set plotting
-train_results <- data.frame(
-  date = train_data$date,
-  actual = y_train,
-  forecasted = as.numeric(y_pred_train),
-  obs_num = seq_along(y_train)
-)
+cat("\n========== LINE PLOTS: FORECASTED VS ACTUAL (TRAINING SET) ==========\n\n")
 
-# Line plot: Forecasted vs Actual for training set
-ggplot(train_results, aes(x = date)) +
-  geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
-  geom_line(aes(y = forecasted, color = "Ridge Forecast"), linewidth = 0.8, linetype = "dashed") +
-  labs(
-    title = "Ridge Regression: Forecasted vs Actual Returns (Training Set)",
-    x = "Date",
-    y = "Log Return",
-    color = "Series"
-  ) +
-  scale_color_manual(values = c("Actual" = "steelblue", "Ridge Forecast" = "coral")) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
+for (horizon in c("3m", "6m", "12m")) {
+  
+  X_train_h <- get(paste0("X_train_", horizon))
+  y_train_h <- get(paste0("y_train_", horizon))
+  
+  # Get the fitted model for this horizon
+  ridge_fit_h <- ridge_results[[horizon]]
+  fit_h <- ridge_fit_h$fit
+  lambda_opt_h <- ridge_fit_h$lambda_best
+  
+  # Predict on training data
+  y_pred_train_h <- predict(fit_h, newx = X_train_h, s = lambda_opt_h)
+  
+  # Create a data frame for training set plotting
+  train_results_h <- data.frame(
+    date = train_data$date,
+    actual = y_train_h,
+    forecasted = as.numeric(y_pred_train_h),
+    obs_num = seq_along(y_train_h)
+  )
+  
+  # Line plot: Forecasted vs Actual for training set
+  p <- ggplot(train_results_h, aes(x = date)) +
+    geom_line(aes(y = actual, color = "Actual"), linewidth = 1) +
+    geom_line(aes(y = forecasted, color = "Ridge Forecast"), linewidth = 0.8, linetype = "dashed") +
+    labs(
+      title = paste("Ridge Regression - Forecasted vs Actual:", toupper(horizon), "Horizon (Training Set)"),
+      x = "Date",
+      y = "Log Return",
+      color = "Series"
+    ) +
+    scale_color_manual(values = c("Actual" = "steelblue", "Ridge Forecast" = "coral")) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p)
+}
+
+cat("\n========== END TRAINING LINE PLOTS ==========\n")
 
 ```
 
 ```{r}
-# ---- Scatter plot: Training set Forecasted vs Actual ----
+# ---- Scatter plots: Training set Forecasted vs Actual (ALL HORIZONS) ----
 
-# Compute training metrics for display
-mae_train <- mae(y_train, y_pred_train)
-rmse_train <- rmse(y_train, y_pred_train)
-r2_train <- cor(y_train, y_pred_train)^2
+cat("\n========== SCATTER PLOTS: FORECAST ACCURACY (TRAINING SET) ==========\n\n")
 
-ggplot(train_results, aes(x = actual, y = forecasted)) +
-  geom_point(alpha = 0.6, color = "steelblue", size = 2) +
-  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
-  labs(
-    title = "Ridge Regression: Training Set Forecast Accuracy",
-    x = "Actual Return",
-    y = "Forecasted Return",
-    subtitle = paste("R² =", round(r2_train, 4), "| RMSE =", round(rmse_train, 6))
-  ) +
-  theme_minimal() +
-  coord_fixed(ratio = 1)
+for (horizon in c("3m", "6m", "12m")) {
+  
+  X_train_h <- get(paste0("X_train_", horizon))
+  y_train_h <- get(paste0("y_train_", horizon))
+  
+  # Get the fitted model for this horizon
+  ridge_fit_h <- ridge_results[[horizon]]
+  fit_h <- ridge_fit_h$fit
+  lambda_opt_h <- ridge_fit_h$lambda_best
+  
+  # Predict on training data
+  y_pred_train_h <- predict(fit_h, newx = X_train_h, s = lambda_opt_h)
+  
+  # Compute training metrics for display
+  mae_train_h <- mae(y_train_h, y_pred_train_h)
+  rmse_train_h <- rmse(y_train_h, y_pred_train_h)
+  r2_train_h <- cor(y_train_h, y_pred_train_h)^2
+  
+  # Create training results data frame
+  train_results_h <- data.frame(
+    actual = y_train_h,
+    forecasted = as.numeric(y_pred_train_h)
+  )
+  
+  p <- ggplot(train_results_h, aes(x = actual, y = forecasted)) +
+    geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+    labs(
+      title = paste("Ridge Regression - Training Set Forecast Accuracy:", toupper(horizon), "Horizon"),
+      x = "Actual Return",
+      y = "Forecasted Return",
+      subtitle = paste("R² =", round(r2_train_h, 4), "| RMSE =", round(rmse_train_h, 6), "| MAE =", round(mae_train_h, 6))
+    ) +
+    theme_minimal() +
+    coord_fixed(ratio = 1)
+  
+  print(p)
+}
+
+cat("\n========== END TRAINING SCATTER PLOTS ==========\n")
+
 ```

@@ -22,6 +22,12 @@ library(ggplot2)
 library(knitr)
 library(scales)
 library(gridExtra)
+
+# Create output directory if it doesn't exist
+if (!dir.exists("../output")) {
+  dir.create("../output")
+  cat("✓ Created output directory\n")
+}
 ```
 
 # Executive Summary
@@ -288,8 +294,8 @@ tactical_backtest <- function(data, forecast_col, actual_col, tbill_col, horizon
   drawdown <- (portfolio_value - cummax_value) / cummax_value
   max_drawdown <- min(drawdown)
   
-  # Win rate
-  win_rate <- sum(period_returns > 0, na.rm = TRUE) / sum(!is.na(period_returns))
+  # Perfect foresight agreement rate (to be calculated later)
+  agreement_rate <- NA  # Will be calculated when comparing to perfect foresight
   
   # Turnover (position changes)
   switches <- sum(position[-1] != position[-length(position)], na.rm = TRUE)
@@ -305,11 +311,12 @@ tactical_backtest <- function(data, forecast_col, actual_col, tbill_col, horizon
     annualized_vol = annualized_vol,
     sharpe_ratio = sharpe_ratio,
     max_drawdown = max_drawdown,
-    win_rate = win_rate,
+    agreement_rate = agreement_rate,
     turnover = turnover,
     n_switches = switches,
     time_in_sp500 = time_in_sp500,
-    final_value = portfolio_value[n_rebalances + 1]
+    final_value = portfolio_value[n_rebalances + 1],
+    position = position  # Store positions for agreement calculation
   )
   
   cat("  Final value: $", round(metrics$final_value, 4), "\n")
@@ -485,6 +492,23 @@ results_3m[["Perfect Foresight (3M)"]] <- perfect_foresight_benchmark(
 )
 
 cat("\n✓ Quarterly (3M) backtests completed!\n")
+
+# Calculate agreement rates with perfect foresight
+cat("\n=== Calculating Agreement with Perfect Foresight (3M) ===\n")
+perfect_positions <- results_3m[["Perfect Foresight (3M)"]]$metrics$position
+
+for (strategy_name in names(results_3m)) {
+  if (strategy_name != "Perfect Foresight (3M)" && !grepl("Buy-Hold", strategy_name)) {
+    strategy_positions <- results_3m[[strategy_name]]$metrics$position
+    # Compare positions (excluding first NA position)
+    valid_idx <- !is.na(strategy_positions) & !is.na(perfect_positions)
+    if (sum(valid_idx) > 0) {
+      agreement <- sum(strategy_positions[valid_idx] == perfect_positions[valid_idx]) / sum(valid_idx)
+      results_3m[[strategy_name]]$metrics$agreement_rate <- agreement
+      cat("  ", strategy_name, ":", percent(agreement, accuracy = 0.1), "\n")
+    }
+  }
+}
 ```
 
 ---
@@ -541,6 +565,23 @@ results_6m[["Perfect Foresight (6M)"]] <- perfect_foresight_benchmark(
 )
 
 cat("\n✓ Semi-Annual (6M) backtests completed!\n")
+
+# Calculate agreement rates with perfect foresight
+cat("\n=== Calculating Agreement with Perfect Foresight (6M) ===\n")
+perfect_positions <- results_6m[["Perfect Foresight (6M)"]]$metrics$position
+
+for (strategy_name in names(results_6m)) {
+  if (strategy_name != "Perfect Foresight (6M)" && !grepl("Buy-Hold", strategy_name)) {
+    strategy_positions <- results_6m[[strategy_name]]$metrics$position
+    # Compare positions (excluding first NA position)
+    valid_idx <- !is.na(strategy_positions) & !is.na(perfect_positions)
+    if (sum(valid_idx) > 0) {
+      agreement <- sum(strategy_positions[valid_idx] == perfect_positions[valid_idx]) / sum(valid_idx)
+      results_6m[[strategy_name]]$metrics$agreement_rate <- agreement
+      cat("  ", strategy_name, ":", percent(agreement, accuracy = 0.1), "\n")
+    }
+  }
+}
 ```
 
 ---
@@ -597,6 +638,23 @@ results_12m[["Perfect Foresight (12M)"]] <- perfect_foresight_benchmark(
 )
 
 cat("\n✓ Annual (12M) backtests completed!\n")
+
+# Calculate agreement rates with perfect foresight
+cat("\n=== Calculating Agreement with Perfect Foresight (12M) ===\n")
+perfect_positions <- results_12m[["Perfect Foresight (12M)"]]$metrics$position
+
+for (strategy_name in names(results_12m)) {
+  if (strategy_name != "Perfect Foresight (12M)" && !grepl("Buy-Hold", strategy_name)) {
+    strategy_positions <- results_12m[[strategy_name]]$metrics$position
+    # Compare positions (excluding first NA position)
+    valid_idx <- !is.na(strategy_positions) & !is.na(perfect_positions)
+    if (sum(valid_idx) > 0) {
+      agreement <- sum(strategy_positions[valid_idx] == perfect_positions[valid_idx]) / sum(valid_idx)
+      results_12m[[strategy_name]]$metrics$agreement_rate <- agreement
+      cat("  ", strategy_name, ":", percent(agreement, accuracy = 0.1), "\n")
+    }
+  }
+}
 ```
 
 ---
@@ -606,8 +664,12 @@ cat("\n✓ Annual (12M) backtests completed!\n")
 ## 6.1 Summary Table - Quarterly (3M)
 
 ```{r performance-table-3m}
-# Extract metrics from all strategies
-metrics_df_3m <- bind_rows(lapply(results_3m, function(x) as.data.frame(x$metrics)))
+# Extract metrics from all strategies (exclude position vector)
+metrics_df_3m <- bind_rows(lapply(results_3m, function(x) {
+  m <- x$metrics
+  m$position <- NULL  # Remove position vector before creating dataframe
+  as.data.frame(m)
+}))
 
 # Format table
 performance_3m <- metrics_df_3m %>%
@@ -617,12 +679,12 @@ performance_3m <- metrics_df_3m %>%
          `Ann. Vol` = annualized_vol,
          `Sharpe Ratio` = sharpe_ratio,
          `Max DD` = max_drawdown,
-         `Win Rate` = win_rate,
+         `Agreement w/ Oracle` = agreement_rate,
          Turnover = turnover,
          `Switches` = n_switches,
          `% in S&P500` = time_in_sp500,
          `Final Value` = final_value) %>%
-  mutate(across(c(`Total Return`, `Ann. Return`, `Ann. Vol`, `Max DD`, `Win Rate`, Turnover, `% in S&P500`), 
+  mutate(across(c(`Total Return`, `Ann. Return`, `Ann. Vol`, `Max DD`, `Agreement w/ Oracle`, Turnover, `% in S&P500`), 
                 ~percent(., accuracy = 0.01)),
          across(c(`Sharpe Ratio`), ~round(., 3)),
          across(c(`Final Value`), ~round(., 4)))
@@ -630,13 +692,21 @@ performance_3m <- metrics_df_3m %>%
 cat("\n=== QUARTERLY (3-MONTH) REBALANCING PERFORMANCE ===\n\n")
 kable(performance_3m, align = "lrrrrrrrrrrr", 
       caption = "Performance Metrics - Quarterly Strategies")
+
+# Save performance table to CSV
+write_csv(metrics_df_3m, "../data/backtest_performance_3m.csv")
+cat("\n✓ Performance table saved: data/backtest_performance_3m.csv\n")
 ```
 
 ## 6.2 Summary Table - Semi-Annual (6M)
 
 ```{r performance-table-6m}
-# Extract metrics
-metrics_df_6m <- bind_rows(lapply(results_6m, function(x) as.data.frame(x$metrics)))
+# Extract metrics (exclude position vector)
+metrics_df_6m <- bind_rows(lapply(results_6m, function(x) {
+  m <- x$metrics
+  m$position <- NULL  # Remove position vector before creating dataframe
+  as.data.frame(m)
+}))
 
 # Format table
 performance_6m <- metrics_df_6m %>%
@@ -646,12 +716,12 @@ performance_6m <- metrics_df_6m %>%
          `Ann. Vol` = annualized_vol,
          `Sharpe Ratio` = sharpe_ratio,
          `Max DD` = max_drawdown,
-         `Win Rate` = win_rate,
+         `Agreement w/ Oracle` = agreement_rate,
          Turnover = turnover,
          `Switches` = n_switches,
          `% in S&P500` = time_in_sp500,
          `Final Value` = final_value) %>%
-  mutate(across(c(`Total Return`, `Ann. Return`, `Ann. Vol`, `Max DD`, `Win Rate`, Turnover, `% in S&P500`), 
+  mutate(across(c(`Total Return`, `Ann. Return`, `Ann. Vol`, `Max DD`, `Agreement w/ Oracle`, Turnover, `% in S&P500`), 
                 ~percent(., accuracy = 0.01)),
          across(c(`Sharpe Ratio`), ~round(., 3)),
          across(c(`Final Value`), ~round(., 4)))
@@ -659,13 +729,21 @@ performance_6m <- metrics_df_6m %>%
 cat("\n=== SEMI-ANNUAL (6-MONTH) REBALANCING PERFORMANCE ===\n\n")
 kable(performance_6m, align = "lrrrrrrrrrrr", 
       caption = "Performance Metrics - Semi-Annual Strategies")
+
+# Save performance table to CSV
+write_csv(metrics_df_6m, "../data/backtest_performance_6m.csv")
+cat("\n✓ Performance table saved: data/backtest_performance_6m.csv\n")
 ```
 
 ## 6.3 Summary Table - Annual (12M)
 
 ```{r performance-table-12m}
-# Extract metrics
-metrics_df_12m <- bind_rows(lapply(results_12m, function(x) as.data.frame(x$metrics)))
+# Extract metrics (exclude position vector)
+metrics_df_12m <- bind_rows(lapply(results_12m, function(x) {
+  m <- x$metrics
+  m$position <- NULL  # Remove position vector before creating dataframe
+  as.data.frame(m)
+}))
 
 # Format table
 performance_12m <- metrics_df_12m %>%
@@ -675,12 +753,12 @@ performance_12m <- metrics_df_12m %>%
          `Ann. Vol` = annualized_vol,
          `Sharpe Ratio` = sharpe_ratio,
          `Max DD` = max_drawdown,
-         `Win Rate` = win_rate,
+         `Agreement w/ Oracle` = agreement_rate,
          Turnover = turnover,
          `Switches` = n_switches,
          `% in S&P500` = time_in_sp500,
          `Final Value` = final_value) %>%
-  mutate(across(c(`Total Return`, `Ann. Return`, `Ann. Vol`, `Max DD`, `Win Rate`, Turnover, `% in S&P500`), 
+  mutate(across(c(`Total Return`, `Ann. Return`, `Ann. Vol`, `Max DD`, `Agreement w/ Oracle`, Turnover, `% in S&P500`), 
                 ~percent(., accuracy = 0.01)),
          across(c(`Sharpe Ratio`), ~round(., 3)),
          across(c(`Final Value`), ~round(., 4)))
@@ -688,6 +766,10 @@ performance_12m <- metrics_df_12m %>%
 cat("\n=== ANNUAL (12-MONTH) REBALANCING PERFORMANCE ===\n\n")
 kable(performance_12m, align = "lrrrrrrrrrrr", 
       caption = "Performance Metrics - Annual Strategies")
+
+# Save performance table to CSV
+write_csv(metrics_df_12m, "../data/backtest_performance_12m.csv")
+cat("\n✓ Performance table saved: data/backtest_performance_12m.csv\n")
 ```
 
 ---
@@ -744,6 +826,14 @@ ggplot(portfolio_3m, aes(x = date, y = portfolio_value, color = Strategy, linety
     legend.text = element_text(size = 9)
   ) +
   guides(color = guide_legend(nrow = 3), linetype = guide_legend(nrow = 3))
+
+# Save plot
+ggsave("../output/portfolio_evolution_3m.png", width = 12, height = 8, dpi = 300)
+cat("\n✓ Plot saved: output/portfolio_evolution_3m.png\n")
+
+# Save portfolio data
+write_csv(portfolio_3m, "../data/portfolio_values_3m.csv")
+cat("✓ Portfolio data saved: data/portfolio_values_3m.csv\n")
 ```
 
 ## 7.2 Portfolio Value Evolution - Semi-Annual (6M)
@@ -796,6 +886,14 @@ ggplot(portfolio_6m, aes(x = date, y = portfolio_value, color = Strategy, linety
     legend.text = element_text(size = 9)
   ) +
   guides(color = guide_legend(nrow = 3), linetype = guide_legend(nrow = 3))
+
+# Save plot
+ggsave("../output/portfolio_evolution_6m.png", width = 12, height = 8, dpi = 300)
+cat("\n✓ Plot saved: output/portfolio_evolution_6m.png\n")
+
+# Save portfolio data
+write_csv(portfolio_6m, "../data/portfolio_values_6m.csv")
+cat("✓ Portfolio data saved: data/portfolio_values_6m.csv\n")
 ```
 
 ## 7.3 Portfolio Value Evolution - Annual (12M)
@@ -848,6 +946,14 @@ ggplot(portfolio_12m, aes(x = date, y = portfolio_value, color = Strategy, linet
     legend.text = element_text(size = 9)
   ) +
   guides(color = guide_legend(nrow = 3), linetype = guide_legend(nrow = 3))
+
+# Save plot
+ggsave("../output/portfolio_evolution_12m.png", width = 12, height = 8, dpi = 300)
+cat("\n✓ Plot saved: output/portfolio_evolution_12m.png\n")
+
+# Save portfolio data
+write_csv(portfolio_12m, "../data/portfolio_values_12m.csv")
+cat("✓ Portfolio data saved: data/portfolio_values_12m.csv\n")
 ```
 
 ## 7.4 Asset Allocation - Random Forest Example
